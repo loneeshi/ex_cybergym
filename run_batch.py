@@ -671,19 +671,44 @@ async def run_batch(
                 )
                 memory_context = memrl.retrieve(query)
 
-            result = await solve_one(
-                session,
-                server,
-                task_id,
-                instance,
-                model,
-                level,
-                timeout,
-                step_limit,
-                idx,
-                total,
-                memory_context,
-            )
+            # Client-side timeout: give server timeout + 120s grace for network/startup
+            client_timeout = timeout + 120
+            t_start = time.monotonic()
+            try:
+                result = await asyncio.wait_for(
+                    solve_one(
+                        session,
+                        server,
+                        task_id,
+                        instance,
+                        model,
+                        level,
+                        timeout,
+                        step_limit,
+                        idx,
+                        total,
+                        memory_context,
+                    ),
+                    timeout=client_timeout,
+                )
+            except asyncio.TimeoutError:
+                elapsed = time.monotonic() - t_start
+                full_task_id = f"{task_id}/{level}" if "/" not in task_id else task_id
+                logger.warning(
+                    "[%d/%d] CLIENT TIMEOUT %s after %.0fs (server timeout=%ds)",
+                    idx + 1,
+                    total,
+                    full_task_id,
+                    elapsed,
+                    timeout,
+                )
+                result = {
+                    "task_id": full_task_id,
+                    "request_id": "",
+                    "status": "timeout",
+                    "error": f"Client-side timeout after {client_timeout}s",
+                    "elapsed": round(elapsed, 1),
+                }
 
             safe_name = _safe_task_name(task_id)
 
