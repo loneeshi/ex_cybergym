@@ -285,9 +285,22 @@ class MemRLHelper:
             self.config = config
 
             if checkpoint_path and Path(checkpoint_path).exists():
-                n = self.service.load_checkpoint_snapshot(checkpoint_path)
+                # save_checkpoint_snapshot creates:
+                #   <ck_dir>/snapshot/<ckpt_id>/  {cube/, qdrant/, snapshot_meta.json}
+                # load_checkpoint_snapshot expects the snapshot_root containing
+                # snapshot_meta.json directly. Resolve the deeper path.
+                snapshot_inner = Path(checkpoint_path) / "snapshot" / "cybergym"
+                if (snapshot_inner / "snapshot_meta.json").exists():
+                    resolved_ckpt = str(snapshot_inner)
+                else:
+                    resolved_ckpt = checkpoint_path
+                    logger.warning(
+                        "Checkpoint meta not found at %s — passing raw path",
+                        snapshot_inner / "snapshot_meta.json",
+                    )
+                n = self.service.load_checkpoint_snapshot(resolved_ckpt)
                 logger.info(
-                    "MEMRL loaded checkpoint: %s (%d memories)", checkpoint_path, n
+                    "MEMRL loaded checkpoint: %s (%d memories)", resolved_ckpt, n
                 )
             else:
                 logger.info("MEMRL initialized (no checkpoint)")

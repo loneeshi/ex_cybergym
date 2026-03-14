@@ -514,6 +514,12 @@ def run_evolution(
 
         # ── Round 1: build MEMRL memories from already-validated results ──
         # (Validation already happened inline during the batch via cybergym_server)
+        logger.info(
+            "DEBUG: round_num=%d, memrl_helper=%s (type=%s)",
+            round_num,
+            memrl_helper is not None,
+            type(memrl_helper).__name__,
+        )
         if round_num == 1 and memrl_helper:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
