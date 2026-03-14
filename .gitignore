@@ -13,4 +13,3 @@ results/qdrant/
 cybergym_dataset.json
 *.sqlite
 **/qdrant/**/.lock
-results/

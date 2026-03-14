@@ -1,0 +1,14 @@
+{
+  "server": "http://10.245.198.39:8000",
+  "model": "sii-holos/Qwen 3.5 397B A17B",
+  "level": "level1",
+  "concurrency": 1,
+  "timeout": 600,
+  "step_limit": 150,
+  "num_rounds": 2,
+  "num_tasks": 1,
+  "memrl_config": "configs/cybergym_memrl.yaml",
+  "cybergym_server": "http://10.1.2.168:3000",
+  "resume_from": 1,
+  "started_at": "2026-03-14T11:25:14.710526"
+}

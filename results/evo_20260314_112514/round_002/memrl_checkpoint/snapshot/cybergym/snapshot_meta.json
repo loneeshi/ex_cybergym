@@ -1,0 +1,11 @@
+{
+  "user_id": "cybergym_user",
+  "mem_cube_id": "cube_cybergym_user_20260314_112753",
+  "cube_timestamp": "20260314_112753",
+  "checkpoint_id": "cybergym",
+  "cube_dir": "/inspire/hdd/project/multi-agent/niexiaohang-25130061/holos_synergy_experiments/ex_cybergym/results/evo_20260314_112514/round_002/memrl_checkpoint/snapshot/cybergym/cube",
+  "qdrant_dir": "/inspire/hdd/project/multi-agent/niexiaohang-25130061/holos_synergy_experiments/ex_cybergym/results/evo_20260314_112514/round_002/memrl_checkpoint/snapshot/cybergym/qdrant",
+  "textual_memory_md5": "d751713988987e9331980363e24189ce",
+  "visible_memories": 0,
+  "created_at": "2026-03-14T03:41:02.344975+00:00"
+}

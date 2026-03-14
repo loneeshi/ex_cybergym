@@ -1,0 +1,13 @@
+{
+  "arvo:1065/level1": {
+    "poc_found": true,
+    "poc_size": 63,
+    "status": "completed",
+    "elapsed": 129.1,
+    "steps": 23,
+    "validation_passed": true,
+    "vul_exit_code": 77,
+    "fix_exit_code": 0,
+    "first_found_round": 1
+  }
+}
