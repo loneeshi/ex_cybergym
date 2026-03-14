@@ -73,6 +73,70 @@ from run_batch import (
 )
 
 
+def _extract_trajectory_from_session(session_path: Path, max_chars: int = 6000) -> str:
+    """Extract a condensed trajectory from a saved session file.
+
+    Pulls out the agent's reasoning (assistant text) and key actions
+    (tool calls + abbreviated results) to create a useful trajectory
+    for MEMRL memory building.
+    """
+    try:
+        session_data = json.loads(session_path.read_text())
+    except Exception:
+        return ""
+
+    messages = session_data.get("messages", [])
+    if not messages:
+        return ""
+
+    parts_out: list[str] = []
+    total_len = 0
+
+    for msg in messages:
+        role = msg.get("info", {}).get("role", "unknown")
+        for part in msg.get("parts", []):
+            ptype = part.get("type", "")
+
+            if ptype == "text" and role == "assistant":
+                # Agent's reasoning and analysis — most valuable
+                text = part.get("content", "").strip()
+                if text:
+                    # Truncate very long assistant messages
+                    if len(text) > 800:
+                        text = text[:400] + "\n...[truncated]...\n" + text[-400:]
+                    parts_out.append(f"[AGENT ANALYSIS]\n{text}")
+                    total_len += len(parts_out[-1])
+
+            elif ptype == "tool-call":
+                tool = part.get("tool", "?")
+                tool_input = part.get("input", {})
+                cmd = (
+                    tool_input.get("command", "")
+                    if isinstance(tool_input, dict)
+                    else str(tool_input)
+                )
+                if cmd:
+                    cmd_short = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                    parts_out.append(f"[TOOL] {tool}: {cmd_short}")
+                    total_len += len(parts_out[-1])
+
+            elif ptype == "tool-result":
+                output = part.get("output", "")
+                if output and len(output) > 300:
+                    output = output[:150] + "...[truncated]..." + output[-150:]
+                if output:
+                    parts_out.append(f"[RESULT] {output}")
+                    total_len += len(parts_out[-1])
+
+            # Stop if we've collected enough
+            if total_len > max_chars:
+                break
+        if total_len > max_chars:
+            break
+
+    return "\n".join(parts_out)
+
+
 # ── Evolution orchestrator ──────────────────────────────────────────────────
 
 
@@ -537,16 +601,30 @@ def run_evolution(
 
                 base_tid = task_id.split("/")[0] if "/" in task_id else task_id
                 inst = instances.get(base_tid, {})
+
+                # Build rich trajectory from session data
+                safe_name = task_id.replace("/", "__").replace(":", "_")
+                session_file = round_dir / "sessions" / f"{safe_name}.json"
+                session_trajectory = _extract_trajectory_from_session(session_file)
+
                 trajectory_summary = (
-                    f"Task: {task_id}\n"
-                    f"Status: {r.get('status')}\n"
-                    f"PoC found: {poc_found}\n"
-                    f"Validated: {r.get('validation_passed') is not None}\n"
-                    f"Passed validation: {real_success}\n"
-                    f"Vul exit code: {r.get('vul_exit_code', 'N/A')}\n"
+                    f"## Task: {task_id}\n"
+                    f"Project: {inst.get('project_name', '?')} ({inst.get('project_language', '?')})\n"
+                    f"Status: {r.get('status')} | PoC found: {poc_found} | "
+                    f"Validation passed: {real_success}\n"
+                    f"Vul exit code: {r.get('vul_exit_code', 'N/A')} | "
                     f"Fix exit code: {r.get('fix_exit_code', 'N/A')}\n"
-                    f"Steps: {r.get('metrics', {}).get('step_count', 0)}"
+                    f"Steps: {r.get('metrics', {}).get('step_count', 0)}\n"
                 )
+                if session_trajectory:
+                    trajectory_summary += (
+                        f"\n## Agent Problem-Solving Trajectory\n{session_trajectory}\n"
+                    )
+                else:
+                    trajectory_summary += (
+                        "\n(No session data available — task may have "
+                        "errored before agent started)\n"
+                    )
                 memrl_helper.build(
                     task_description=inst.get("vulnerability_description", ""),
                     trajectory=trajectory_summary,
