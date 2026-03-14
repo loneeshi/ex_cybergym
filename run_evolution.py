@@ -530,6 +530,8 @@ def run_evolution(
             )
             n_built = 0
             n_build_failed = 0
+            built_mem_ids: list[str] = []
+            built_successes: list[float] = []
 
             def _build_one(r):
                 poc_found = r.get("poc_found", False)
@@ -562,7 +564,7 @@ def run_evolution(
                         "\n(No session data available — task may have "
                         "errored before agent started)\n"
                     )
-                memrl_helper.build(
+                mem_id = memrl_helper.build(
                     task_description=inst.get("vulnerability_description", ""),
                     trajectory=trajectory_summary,
                     metadata={
@@ -574,14 +576,17 @@ def run_evolution(
                         "level": level,
                     },
                 )
-                return task_id
+                return mem_id, real_success
 
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = {executor.submit(_build_one, r): r for r in results}
                 for future in as_completed(futures):
                     try:
-                        future.result()
+                        mem_id, success = future.result()
                         n_built += 1
+                        if mem_id:
+                            built_mem_ids.append(mem_id)
+                            built_successes.append(1.0 if success else 0.0)
                     except Exception as e:
                         n_build_failed += 1
                         task_id = futures[future].get("task_id", "?")
@@ -594,6 +599,24 @@ def run_evolution(
                 len(results),
                 n_build_failed,
             )
+
+            # Batch Q-value update: apply Q-learning with known outcomes
+            # for all memories built in Round 1.
+            # Q = (1-alpha)*0 + alpha*reward → 0.3 (success) or -0.3 (failure)
+            if built_mem_ids:
+                memrl_helper.update_values(
+                    built_successes,
+                    [[mid] for mid in built_mem_ids],
+                )
+                n_pos = sum(1 for s in built_successes if s > 0)
+                n_neg = len(built_successes) - n_pos
+                logger.info(
+                    "Round 1 batch Q-value update: %d memories "
+                    "(%d success → Q≈0.3, %d failure → Q≈-0.3)",
+                    len(built_mem_ids),
+                    n_pos,
+                    n_neg,
+                )
 
         # Save MEMRL checkpoint for next round
         if memrl_helper:

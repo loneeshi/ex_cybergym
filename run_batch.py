@@ -501,20 +501,19 @@ class MemRLHelper:
 
     def build(
         self, task_description: str, trajectory: str, metadata: dict[str, Any]
-    ) -> None:
-        """Build memory from a completed task.
+    ) -> str | None:
+        """Build memory from a completed task. Returns the memory_id.
 
         Also registers the new memory in dict_memory/query_embeddings so that
         retrieve_query() (value-driven hybrid retrieval) can find it.
         build_memory() alone only writes to MemOS but does NOT populate the
         in-process caches that retrieve_query() depends on.
 
-        After building, immediately does a Q-learning self-update using the
-        known task outcome so the memory's Q-value reflects its own result
-        (e.g. 0 → 0.3 for success, 0 → -0.3 for failure with alpha=0.3).
+        NOTE: Q-value update is NOT done here — the caller decides when to
+        update (inline per-task for Round 2+, batch after all tasks for Round 1).
         """
         if not self.service:
-            return
+            return None
         try:
             mem_id = self.service.build_memory(
                 task_description=task_description,
@@ -540,18 +539,10 @@ class MemRLHelper:
                         qe[task_description] = vec
                     except Exception:
                         pass
-
-            # Self-update Q-value using the known task outcome.
-            # Memory was just created with q_init (0), this Q-learning step
-            # immediately differentiates: success → 0.3, failure → -0.3.
-            if mem_id:
-                success = metadata.get("success", False)
-                self.update_values(
-                    [1.0 if success else 0.0],
-                    [[mem_id]],
-                )
+            return mem_id
         except Exception as e:
             logger.warning("Memory build failed: %s", e)
+            return None
 
     def save_checkpoint(self, path: str, ckpt_id: str = "cybergym") -> None:
         """Save memory checkpoint."""
@@ -1030,7 +1021,7 @@ async def run_batch(
                     )
                     trajectory_summary += "\n".join(fallback_parts) + "\n"
 
-                memrl.build(
+                new_mem_id = memrl.build(
                     task_description=(instance.get("vulnerability_description", "")),
                     trajectory=trajectory_summary,
                     metadata={
@@ -1043,6 +1034,14 @@ async def run_batch(
                         "has_trajectory": bool(session_trajectory),
                     },
                 )
+
+                # Inline Q-value self-update: immediately apply Q-learning
+                # with the known task outcome (Round 2+ per-task update).
+                if new_mem_id:
+                    memrl.update_values(
+                        [1.0 if real_success else 0.0],
+                        [[new_mem_id]],
+                    )
 
             (per_task_dir / f"{safe_name}.json").write_text(
                 json.dumps(result, indent=2, ensure_ascii=False)
