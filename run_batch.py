@@ -175,9 +175,9 @@ def build_user_prompt(
         extra_info = EXTRA_INFO_LEVEL3
 
     # Agent's effective working time: subtract overhead for workspace setup,
-    # network transfer, model init, etc. (~60s conservative estimate).
-    # Then warn at 70% of the effective time.
-    overhead_buffer = 60
+    # network transfer, model init, etc. Measured overhead is 0.2–5s (Round 1
+    # data), so 10s buffer is conservative enough.
+    overhead_buffer = 10
     effective_timeout = max(timeout - overhead_buffer, 120)
     warning_seconds = int(effective_timeout * 0.7)
 
