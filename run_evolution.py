@@ -74,6 +74,41 @@ from run_batch import (
 )
 
 
+# ── Round 1 intra-round resume ───────────────────────────────────────────────
+
+
+def _load_completed_round1_tasks(
+    round_dir: Path,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Scan round_dir/tasks/ for completed task results from a previous run.
+
+    Returns:
+        (completed_results, completed_task_ids)
+        Only tasks with status == "completed" are considered done.
+        error / timeout tasks will be retried.
+    """
+    tasks_dir = round_dir / "tasks"
+    if not tasks_dir.exists():
+        return [], set()
+
+    completed: list[dict[str, Any]] = []
+    completed_ids: set[str] = set()
+
+    for f in tasks_dir.glob("*.json"):
+        try:
+            r = json.loads(f.read_text())
+            if r.get("status") == "completed":
+                completed.append(r)
+                tid = r.get("task_id", "")
+                # task_id has "/level1" suffix, strip for matching
+                base_tid = tid.split("/")[0] if "/" in tid else tid
+                completed_ids.add(base_tid)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to read task file %s: %s", f, e)
+
+    return completed, completed_ids
+
+
 # ── Evolution orchestrator ──────────────────────────────────────────────────
 
 
@@ -474,22 +509,43 @@ def run_evolution(
         # Round 2+: memrl enabled for memory retrieval + building
         round_t0 = time.monotonic()
         if round_num == 1:
-            results = asyncio.run(
-                run_single_round(
-                    round_num=round_num,
-                    server=server,
-                    task_ids=task_ids,
-                    instances=instances,
-                    model=model,
-                    level=level,
-                    concurrency=concurrency,
-                    timeout=timeout,
-                    step_limit=step_limit,
-                    output_dir=round_dir,
-                    memrl=None,
-                    cybergym_server=cybergym_server,
+            # ── Round 1 intra-round resume: skip already-completed tasks ──
+            prev_completed, prev_completed_ids = _load_completed_round1_tasks(round_dir)
+            remaining_task_ids = [
+                tid for tid in task_ids if tid not in prev_completed_ids
+            ]
+            if prev_completed:
+                logger.info(
+                    "Round 1 resume: %d tasks already completed, %d remaining "
+                    "(skipping %d error/timeout for retry)",
+                    len(prev_completed),
+                    len(remaining_task_ids),
+                    len(task_ids) - len(prev_completed) - len(remaining_task_ids),
                 )
-            )
+
+            if remaining_task_ids:
+                new_results = asyncio.run(
+                    run_single_round(
+                        round_num=round_num,
+                        server=server,
+                        task_ids=remaining_task_ids,
+                        instances=instances,
+                        model=model,
+                        level=level,
+                        concurrency=concurrency,
+                        timeout=timeout,
+                        step_limit=step_limit,
+                        output_dir=round_dir,
+                        memrl=None,
+                        cybergym_server=cybergym_server,
+                    )
+                )
+            else:
+                new_results = []
+                logger.info("Round 1: all tasks already completed — skipping batch")
+
+            # Merge: previously completed + newly run
+            results = prev_completed + new_results
         else:
             # Round 2+: memrl retrieves memories, inline validation for reward
             results = asyncio.run(
