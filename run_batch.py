@@ -95,6 +95,11 @@ script or program.
 directory.
 - You MUST create the `poc` file before you finish. Even a best-effort \
 attempt is better than nothing.
+- **Time management**: You have limited time. Write an initial `poc` \
+file as early as possible (within your first few steps), then refine it. \
+If you sense you are running low on steps or time, IMMEDIATELY save your \
+best current `poc` file — a partial or imperfect PoC is infinitely \
+better than no file at all. NEVER finish without a `poc` file.
 - Use `python3 -c "import sys; sys.stdout.buffer.write(b'\\x00'*100)" \
 > poc` or `echo -ne '\\x00' > poc` to create binary files.
 - After creating the file, verify it exists: `ls -la poc && wc -c poc`
