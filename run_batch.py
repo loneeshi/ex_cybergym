@@ -42,7 +42,7 @@ DEFAULT_SERVER = "http://localhost:8000"
 DEFAULT_MODEL = "sii-nex/Nex N1.1"
 DEFAULT_LEVEL = "level1"
 DEFAULT_CONCURRENCY = 16
-DEFAULT_TIMEOUT = 6000 
+DEFAULT_TIMEOUT = 6000
 DEFAULT_STEP_LIMIT = 100  # matches CyberGym paper (100 iterations)
 
 # ── Prompt templates ────────────────────────────────────────────────────────
@@ -411,26 +411,56 @@ class MemRLHelper:
             logger.error("Failed to initialize MEMRL: %s", e)
             raise
 
-    def retrieve(self, query: str) -> str:
-        """Retrieve relevant memories and format as prompt context."""
+    def retrieve(self, query: str) -> tuple[str, list[str]]:
+        """Retrieve relevant memories and format as prompt context.
+
+        Returns:
+            (formatted_prompt_text, list_of_retrieved_memory_ids)
+        """
         if not self.service:
-            return ""
+            return "", []
         try:
             k = getattr(self.config.memory, "k_retrieve", 3)
             threshold = getattr(self.config.memory, "confidence_threshold", 0.0)
             memories = self.service.retrieve(query, k=k, threshold=threshold)
             if not memories:
-                return ""
+                return "", []
+            memory_ids = [
+                mem["memory_id"]
+                for mem in memories
+                if mem.get("memory_id") and mem["memory_id"] != "unknown"
+            ]
             parts = []
             for i, mem in enumerate(memories, 1):
                 content = mem.get("content", mem.get("full_content", ""))
                 if len(content) > 2000:
                     content = content[:2000] + "\n... (truncated)"
                 parts.append(f"[Experience {i}]\n{content}")
-            return MEMORY_CONTEXT_TEMPLATE.format(memories="\n\n".join(parts))
+            text = MEMORY_CONTEXT_TEMPLATE.format(memories="\n\n".join(parts))
+            return text, memory_ids
         except Exception as e:
             logger.warning("Memory retrieval failed: %s", e)
-            return ""
+            return "", []
+
+    def update_values(
+        self, successes: list[float], retrieved_ids_list: list[list[str]]
+    ) -> None:
+        """Update Q-values for retrieved memories based on task outcomes.
+
+        This is the RL feedback loop: memories that were retrieved before a
+        successful task get a positive reward, and vice versa for failures.
+        """
+        if not self.service:
+            return
+        try:
+            result = self.service.update_values(successes, retrieved_ids_list)
+            n_updated = (
+                sum(1 for v in result.values() if v is not None) if result else 0
+            )
+            if n_updated:
+                logger.debug("Q-value updates: %d memories updated", n_updated)
+        except Exception as e:
+            logger.warning("Q-value update failed: %s", e)
 
     def build(
         self, task_description: str, trajectory: str, metadata: dict[str, Any]
@@ -776,12 +806,13 @@ async def run_batch(
             instance = instances.get(task_id, {})
 
             memory_context = ""
+            retrieved_ids: list[str] = []
             if memrl:
                 query = (
                     f"{instance.get('vulnerability_description', '')} "
                     f"{instance.get('crash_type', '')}"
                 )
-                memory_context = memrl.retrieve(query)
+                memory_context, retrieved_ids = memrl.retrieve(query)
 
             # Client-side timeout: give server timeout + 120s grace for network/startup
             client_timeout = timeout + 120
@@ -880,6 +911,13 @@ async def run_batch(
                 real_success = poc_found
 
             if memrl:
+                # ── Update Q-values for retrieved memories (RL feedback) ──
+                if retrieved_ids:
+                    memrl.update_values(
+                        [1.0 if real_success else 0.0],
+                        [retrieved_ids],
+                    )
+
                 # Build rich trajectory from saved session file
                 session_file = sessions_dir / f"{safe_name}.json"
                 session_trajectory = _extract_session_trajectory(session_file)
