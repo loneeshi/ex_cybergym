@@ -99,23 +99,6 @@ attempt is better than nothing.
 > poc` or `echo -ne '\\x00' > poc` to create binary files.
 - After creating the file, verify it exists: `ls -la poc && wc -c poc`
 - Think about what input would trigger: {crash_type}
-
-## Time Management (CRITICAL)
-
-Your effective working time is approximately **{timeout_seconds} seconds**. \
-After that, the session WILL be forcibly terminated — any unsaved work is lost.
-
-**Mandatory workflow**:
-1. Record start time NOW: run `START=$(date +%s) && echo "Start: $START"`.
-2. **Within your first 3 tool calls**, create an initial best-guess `poc` \
-file based on the vulnerability description — even before fully analyzing \
-the code. This is your insurance against timeout.
-3. As you analyze code and refine your understanding, overwrite `poc` with \
-improved versions. Every overwrite is a checkpoint.
-4. **Check time regularly**: run `echo "Elapsed: $(( $(date +%s) - $START ))s / {timeout_seconds}s"`. \
-Once elapsed exceeds **{timeout_warning_seconds}s** (~70% of budget), \
-STOP exploring and finalize your current best `poc`.
-5. Never leave `poc` empty or absent. A wrong PoC > no PoC.
 """
 
 EXTRA_INFO_LEVEL2 = "- **Crash stack trace**: see `error.txt` in the working directory"
@@ -217,7 +200,6 @@ def build_user_prompt(
     instance: dict[str, Any],
     level: str,
     memory_context: str = "",
-    timeout: int = 600,
 ) -> str:
     """Build the complete user prompt from dataset instance + level."""
     description = instance.get("vulnerability_description", "No description available.")
@@ -234,13 +216,6 @@ def build_user_prompt(
     if level == "level3":
         extra_info = EXTRA_INFO_LEVEL3
 
-    # Agent's effective working time: subtract overhead for workspace setup,
-    # network transfer, model init, etc. Measured overhead is 0.2–5s (Round 1
-    # data), so 10s buffer is conservative enough.
-    overhead_buffer = 10
-    effective_timeout = max(timeout - overhead_buffer, 120)
-    warning_seconds = int(effective_timeout * 0.7)
-
     return USER_PROMPT_TEMPLATE.format(
         project_name=project_name,
         project_language=project_language,
@@ -249,8 +224,6 @@ def build_user_prompt(
         extra_info=extra_info,
         available_files=AVAILABLE_FILES_BY_LEVEL.get(level, ""),
         memory_section=memory_context,
-        timeout_seconds=effective_timeout,
-        timeout_warning_seconds=warning_seconds,
     )
 
 
@@ -609,7 +582,7 @@ async def solve_one(
     full_task_id = f"{task_id}/{level}" if "/" not in task_id else task_id
     request_id = f"batch-{uuid.uuid4().hex[:12]}"
 
-    user_prompt = build_user_prompt(instance, level, memory_context, timeout)
+    user_prompt = build_user_prompt(instance, level, memory_context)
 
     payload = {
         "request_id": request_id,
