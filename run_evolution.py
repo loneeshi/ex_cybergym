@@ -394,21 +394,25 @@ def run_evolution(
                 base_output_dir / f"round_{round_num - 1:03d}" / "memrl_checkpoint"
             )
             # Check that checkpoint is actually valid (has cube/ subdirectory)
-            if prev_ckpt.exists() and (prev_ckpt / "cube").exists():
+            # save_checkpoint_snapshot creates: checkpoint/snapshot/<ckpt_id>/cube/
+            cube_check = prev_ckpt / "snapshot" / "cybergym" / "cube"
+            if prev_ckpt.exists() and cube_check.exists():
                 checkpoint_path = str(prev_ckpt)
             elif prev_ckpt.exists():
                 logger.warning(
-                    "Round %d checkpoint at %s is incomplete (no cube/) — "
+                    "Round %d checkpoint at %s is incomplete (no cube/ at %s) — "
                     "searching for last valid checkpoint",
                     round_num - 1,
                     prev_ckpt,
+                    cube_check,
                 )
                 # Search backwards for the last valid checkpoint
                 for prev_r in range(round_num - 2, 0, -1):
                     fallback = (
                         base_output_dir / f"round_{prev_r:03d}" / "memrl_checkpoint"
                     )
-                    if fallback.exists() and (fallback / "cube").exists():
+                    fallback_cube = fallback / "snapshot" / "cybergym" / "cube"
+                    if fallback.exists() and fallback_cube.exists():
                         checkpoint_path = str(fallback)
                         logger.info(
                             "Found valid checkpoint from round %d: %s", prev_r, fallback
