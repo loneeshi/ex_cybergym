@@ -1,0 +1,11 @@
+{
+  "user_id": "cybergym_user",
+  "mem_cube_id": "cube_cybergym_user_snapshot",
+  "cube_timestamp": "20260314_164050",
+  "checkpoint_id": "cybergym",
+  "cube_dir": "results/timeout300_test/memrl_checkpoint/snapshot/cybergym/cube",
+  "qdrant_dir": "results/timeout300_test/memrl_checkpoint/snapshot/cybergym/qdrant",
+  "textual_memory_md5": "27144b0f8aaf4a90bf9988d70e4c551e",
+  "visible_memories": 0,
+  "created_at": "2026-03-14T08:46:40.898428+00:00"
+}

@@ -1,0 +1,76 @@
+{
+  "model_schema": "memos.configs.mem_cube.GeneralMemCubeConfig",
+  "config_filename": "config.json",
+  "user_id": "cybergym_user",
+  "cube_id": "1ad03cb4-401a-45d6-ac17-7b0e64293313",
+  "text_mem": {
+    "backend": "general_text",
+    "config": {
+      "cube_id": null,
+      "memory_filename": "textual_memory.json",
+      "extractor_llm": {
+        "backend": "openai",
+        "config": {
+          "model_name_or_path": "qwen3.5-397b-a17b",
+          "temperature": 0.7,
+          "max_tokens": 8192,
+          "top_p": 0.95,
+          "top_k": 50,
+          "remove_think_prefix": false,
+          "default_headers": null,
+          "api_key": "nDhN1Er0ejVN6fkWeEfIxkzPMsVngPtgxoQXporHIR8=",
+          "api_base": "https://holos.openapi-qb.sii.edu.cn/v1",
+          "extra_body": null
+        }
+      },
+      "vector_db": {
+        "backend": "qdrant",
+        "config": {
+          "collection_name": "memp_cybergym_user_20260314_141249",
+          "vector_dimension": 4096,
+          "distance_metric": "cosine",
+          "host": null,
+          "port": null,
+          "path": "/inspire/hdd/project/multi-agent/niexiaohang-25130061/holos_synergy_experiments/ex_cybergym/results/qdrant/cybergym_user/20260314_141249",
+          "url": null,
+          "api_key": null
+        }
+      },
+      "embedder": {
+        "backend": "universal_api",
+        "config": {
+          "model_name_or_path": "qwen3-embedding-8b",
+          "embedding_dims": null,
+          "max_tokens": 8192,
+          "headers_extra": null,
+          "provider": "openai",
+          "api_key": "nDhN1Er0ejVN6fkWeEfIxkzPMsVngPtgxoQXporHIR8=",
+          "base_url": "https://og5o9mjcdgckcmejjobdgmjh9ddcjcmk.openapi-qb.sii.edu.cn/v1",
+          "backup_client": false,
+          "backup_base_url": null,
+          "backup_api_key": null,
+          "backup_headers_extra": null,
+          "backup_model_name_or_path": null
+        }
+      }
+    }
+  },
+  "act_mem": {
+    "backend": "uninitialized",
+    "config": {
+      "cube_id": null
+    }
+  },
+  "para_mem": {
+    "backend": "uninitialized",
+    "config": {
+      "cube_id": null
+    }
+  },
+  "pref_mem": {
+    "backend": "uninitialized",
+    "config": {
+      "cube_id": null
+    }
+  }
+}

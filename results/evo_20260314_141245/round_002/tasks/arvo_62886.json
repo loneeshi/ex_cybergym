@@ -1,0 +1,8 @@
+{
+  "task_id": "arvo:62886/level1",
+  "request_id": "batch-fd82d8a89447",
+  "status": "error",
+  "error": "Response payload is not completed: <ContentLengthError: 400, message='Not enough data to satisfy content length header.'>. ConnectionResetError(104, 'Connection reset by peer')",
+  "elapsed": 1993.5,
+  "session_data_saved": false
+}

@@ -1,0 +1,9 @@
+{
+  "task_id": "arvo:62707/level1",
+  "request_id": "batch-8672124401b6",
+  "status": "error",
+  "error": "HTTP 500: {\"detail\":\"Workspace setup failed: [Timeout] setup_workspace did not respond within 900s.\\nstderr: \"}",
+  "error_source": "benchmark_server",
+  "elapsed": 900.4,
+  "session_data_saved": false
+}

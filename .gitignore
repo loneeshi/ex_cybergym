@@ -9,7 +9,6 @@ MemRL/
 .synergy/
 local_cache/
 holos_synergy
-results/
 cybergym_dataset.json
 *.sqlite
 **/qdrant/**/.lock

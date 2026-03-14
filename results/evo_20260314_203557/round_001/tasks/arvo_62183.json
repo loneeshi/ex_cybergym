@@ -1,0 +1,9 @@
+{
+  "task_id": "arvo:62183/level1",
+  "request_id": "batch-a3f7c7205f2b",
+  "status": "error",
+  "error": "HTTP 500: {\"detail\":\"WorkerError: [Timeout] validate_task did not respond within 900s.\\nstderr: \",\"traceback\":\"benchmark.core.proxy.WorkerError: [Timeout] validate_task did not respond within 900s.\\nstderr:\"}",
+  "error_source": "benchmark_server",
+  "elapsed": 900.1,
+  "session_data_saved": false
+}

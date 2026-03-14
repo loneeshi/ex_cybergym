@@ -1,0 +1,9 @@
+{
+  "task_id": "arvo:57436/level1",
+  "request_id": "batch-9b6bd6b7f4f3",
+  "status": "error",
+  "error": "Server disconnected",
+  "error_source": "benchmark_server",
+  "elapsed": 0.0,
+  "session_data_saved": false
+}
