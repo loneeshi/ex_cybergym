@@ -64,6 +64,7 @@ from run_batch import (
     SYSTEM_PROMPT,
     USER_PROMPT_TEMPLATE,
     MemRLHelper,
+    _extract_session_trajectory,
     build_user_prompt,
     check_server_health,
     load_dataset_instances,
@@ -71,70 +72,6 @@ from run_batch import (
     print_summary,
     run_batch,
 )
-
-
-def _extract_trajectory_from_session(session_path: Path, max_chars: int = 6000) -> str:
-    """Extract a condensed trajectory from a saved session file.
-
-    Pulls out the agent's reasoning (assistant text) and key actions
-    (tool calls + abbreviated results) to create a useful trajectory
-    for MEMRL memory building.
-    """
-    try:
-        session_data = json.loads(session_path.read_text())
-    except Exception:
-        return ""
-
-    messages = session_data.get("messages", [])
-    if not messages:
-        return ""
-
-    parts_out: list[str] = []
-    total_len = 0
-
-    for msg in messages:
-        role = msg.get("info", {}).get("role", "unknown")
-        for part in msg.get("parts", []):
-            ptype = part.get("type", "")
-
-            if ptype == "text" and role == "assistant":
-                # Agent's reasoning and analysis — most valuable
-                text = part.get("content", "").strip()
-                if text:
-                    # Truncate very long assistant messages
-                    if len(text) > 800:
-                        text = text[:400] + "\n...[truncated]...\n" + text[-400:]
-                    parts_out.append(f"[AGENT ANALYSIS]\n{text}")
-                    total_len += len(parts_out[-1])
-
-            elif ptype == "tool-call":
-                tool = part.get("tool", "?")
-                tool_input = part.get("input", {})
-                cmd = (
-                    tool_input.get("command", "")
-                    if isinstance(tool_input, dict)
-                    else str(tool_input)
-                )
-                if cmd:
-                    cmd_short = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                    parts_out.append(f"[TOOL] {tool}: {cmd_short}")
-                    total_len += len(parts_out[-1])
-
-            elif ptype == "tool-result":
-                output = part.get("output", "")
-                if output and len(output) > 300:
-                    output = output[:150] + "...[truncated]..." + output[-150:]
-                if output:
-                    parts_out.append(f"[RESULT] {output}")
-                    total_len += len(parts_out[-1])
-
-            # Stop if we've collected enough
-            if total_len > max_chars:
-                break
-        if total_len > max_chars:
-            break
-
-    return "\n".join(parts_out)
 
 
 # ── Evolution orchestrator ──────────────────────────────────────────────────
@@ -605,7 +542,7 @@ def run_evolution(
                 # Build rich trajectory from session data
                 safe_name = task_id.replace("/", "__").replace(":", "_")
                 session_file = round_dir / "sessions" / f"{safe_name}.json"
-                session_trajectory = _extract_trajectory_from_session(session_file)
+                session_trajectory = _extract_session_trajectory(session_file)
 
                 trajectory_summary = (
                     f"## Task: {task_id}\n"
