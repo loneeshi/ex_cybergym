@@ -511,12 +511,16 @@ def run_evolution(
         # ── Round 1: build MEMRL memories from already-validated results ──
         # (Validation already happened inline during the batch via cybergym_server)
         if round_num == 1 and memrl_helper:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             logger.info(
-                "Round 1: building MEMRL memories from %d results...", len(results)
+                "Round 1: building MEMRL memories from %d results (concurrent)...",
+                len(results),
             )
             n_built = 0
             n_build_failed = 0
-            for r in results:
+
+            def _build_one(r):
                 poc_found = r.get("poc_found", False)
                 task_id = r.get("task_id", "")
                 real_success = r.get("validation_passed", poc_found)
@@ -533,24 +537,31 @@ def run_evolution(
                     f"Fix exit code: {r.get('fix_exit_code', 'N/A')}\n"
                     f"Steps: {r.get('metrics', {}).get('step_count', 0)}"
                 )
-                try:
-                    memrl_helper.build(
-                        task_description=inst.get("vulnerability_description", ""),
-                        trajectory=trajectory_summary,
-                        metadata={
-                            "source": "cybergym",
-                            "task_id": task_id,
-                            "project": inst.get("project_name", ""),
-                            "success": real_success,
-                            "validated": r.get("validation_passed") is not None,
-                            "level": level,
-                        },
-                    )
-                    n_built += 1
-                except Exception as e:
-                    n_build_failed += 1
-                    if n_build_failed <= 3:
-                        logger.warning("Memory build failed for %s: %s", task_id, e)
+                memrl_helper.build(
+                    task_description=inst.get("vulnerability_description", ""),
+                    trajectory=trajectory_summary,
+                    metadata={
+                        "source": "cybergym",
+                        "task_id": task_id,
+                        "project": inst.get("project_name", ""),
+                        "success": real_success,
+                        "validated": r.get("validation_passed") is not None,
+                        "level": level,
+                    },
+                )
+                return task_id
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(_build_one, r): r for r in results}
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                        n_built += 1
+                    except Exception as e:
+                        n_build_failed += 1
+                        task_id = futures[future].get("task_id", "?")
+                        if n_build_failed <= 3:
+                            logger.warning("Memory build failed for %s: %s", task_id, e)
 
             logger.info(
                 "Round 1 memory build done: %d/%d built, %d failed",
