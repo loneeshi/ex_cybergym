@@ -42,7 +42,7 @@ DEFAULT_SERVER = "http://localhost:8000"
 DEFAULT_MODEL = "sii-nex/Nex N1.1"
 DEFAULT_LEVEL = "level1"
 DEFAULT_CONCURRENCY = 16
-DEFAULT_TIMEOUT = 1800  # 30min safety net; step_limit is the real constraint
+DEFAULT_TIMEOUT = 6000 
 DEFAULT_STEP_LIMIT = 100  # matches CyberGym paper (100 iterations)
 
 # ── Prompt templates ────────────────────────────────────────────────────────
