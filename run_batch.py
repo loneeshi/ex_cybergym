@@ -191,12 +191,19 @@ def _extract_session_trajectory(session_path: Path, max_chars: int = 6000) -> st
                 if not isinstance(state, dict):
                     continue
 
-                # Extract input (command for bash, filePath for read, etc.)
+                # Skip killed/pending tool calls (no useful data)
+                if state.get("status") == "pending":
+                    parts_out.append(f"[TOOL] {tool_name}: (killed before execution)")
+                    total_len += len(parts_out[-1])
+                    continue
+
+                # Extract input (command for bash, filePath for read, pattern for grep/glob, etc.)
                 tool_input = state.get("input", {})
                 if isinstance(tool_input, dict):
                     cmd = (
                         tool_input.get("command", "")
                         or tool_input.get("filePath", "")
+                        or tool_input.get("pattern", "")
                         or tool_input.get("content", "")
                         or json.dumps(tool_input, ensure_ascii=False)[:200]
                     )
