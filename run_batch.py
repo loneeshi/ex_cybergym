@@ -1049,13 +1049,50 @@ async def run_batch(
             results.append(result)
             return result
 
+    logger.info(
+        "Starting batch: %d tasks, concurrency=%d, timeout=%ds",
+        total,
+        concurrency,
+        timeout,
+    )
+
     connector = aiohttp.TCPConnector(limit=concurrency + 2)
     client_timeout = aiohttp.ClientTimeout(total=timeout + 120)
+
+    # Periodic progress reporter
+    _progress_count = {"done": 0, "ok": 0, "err": 0, "t0": time.monotonic()}
+
+    def _log_progress(result: dict):
+        _progress_count["done"] += 1
+        if result.get("status") == "completed":
+            _progress_count["ok"] += 1
+        else:
+            _progress_count["err"] += 1
+        done = _progress_count["done"]
+        if done % 20 == 0 or done == total:
+            elapsed = time.monotonic() - _progress_count["t0"]
+            ok = _progress_count["ok"]
+            err = _progress_count["err"]
+            eta = (total - done) / done * elapsed if done else 0
+            logger.info(
+                "PROGRESS: %d/%d done (ok=%d, fail=%d) | %.0fs elapsed, ETA ~%.0fmin",
+                done,
+                total,
+                ok,
+                err,
+                elapsed,
+                eta / 60,
+            )
+
+    async def _tracked_solve(tid, idx):
+        result = await bounded_solve(tid, idx)
+        _log_progress(result)
+        return result
 
     async with aiohttp.ClientSession(
         connector=connector, timeout=client_timeout
     ) as session:
-        tasks = [bounded_solve(tid, i) for i, tid in enumerate(task_ids)]
+        tasks = [_tracked_solve(tid, i) for i, tid in enumerate(task_ids)]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     return results

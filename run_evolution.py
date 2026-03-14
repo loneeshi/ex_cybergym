@@ -524,6 +524,11 @@ def run_evolution(
                 )
 
             if remaining_task_ids:
+                logger.info(
+                    "Round 1: submitting %d tasks to benchmark server (concurrency=%d)...",
+                    len(remaining_task_ids),
+                    concurrency,
+                )
                 new_results = asyncio.run(
                     run_single_round(
                         round_num=round_num,
