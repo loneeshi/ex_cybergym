@@ -508,6 +508,10 @@ class MemRLHelper:
         retrieve_query() (value-driven hybrid retrieval) can find it.
         build_memory() alone only writes to MemOS but does NOT populate the
         in-process caches that retrieve_query() depends on.
+
+        After building, immediately does a Q-learning self-update using the
+        known task outcome so the memory's Q-value reflects its own result
+        (e.g. 0 → 0.3 for success, 0 → -0.3 for failure with alpha=0.3).
         """
         if not self.service:
             return
@@ -536,6 +540,16 @@ class MemRLHelper:
                         qe[task_description] = vec
                     except Exception:
                         pass
+
+            # Self-update Q-value using the known task outcome.
+            # Memory was just created with q_init (0), this Q-learning step
+            # immediately differentiates: success → 0.3, failure → -0.3.
+            if mem_id:
+                success = metadata.get("success", False)
+                self.update_values(
+                    [1.0 if success else 0.0],
+                    [[mem_id]],
+                )
         except Exception as e:
             logger.warning("Memory build failed: %s", e)
 

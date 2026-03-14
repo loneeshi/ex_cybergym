@@ -52,8 +52,8 @@ rl_config:
   tau: 0.25
   alpha: 0.3
   gamma: 0.0
-  q_init_pos: 1.0
-  q_init_neg: -1.0
+  q_init_pos: 0.0
+  q_init_neg: 0.0
   success_reward: 1.0
   failure_reward: -1.0
   topk: 3
