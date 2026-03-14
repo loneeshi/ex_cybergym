@@ -623,6 +623,7 @@ async def solve_one(
                     "request_id": request_id,
                     "status": "error",
                     "error": f"HTTP {resp.status}: {error_text[:500]}",
+                    "error_source": "benchmark_server",
                     "elapsed": round(elapsed, 1),
                 }
 
@@ -670,11 +671,24 @@ async def solve_one(
         raise
     except Exception as e:
         elapsed = time.monotonic() - t0
+        # Classify error source from exception type
+        err_str = str(e)
+        if "ConnectionReset" in err_str or "ConnectionRefused" in err_str:
+            error_source = "benchmark_server"
+        elif "ContentLengthError" in err_str or "payload" in err_str.lower():
+            error_source = "benchmark_server"
+        elif "TimeoutError" in type(e).__name__:
+            error_source = "network"
+        elif "DNS" in err_str or "getaddrinfo" in err_str:
+            error_source = "network"
+        else:
+            error_source = "benchmark_server"
         logger.error(
-            "[%d/%d] EXCEPTION %s — %s (%.1fs)",
+            "[%d/%d] EXCEPTION %s — [%s] %s (%.1fs)",
             idx + 1,
             total,
             full_task_id,
+            error_source,
             e,
             elapsed,
         )
@@ -683,6 +697,7 @@ async def solve_one(
             "request_id": request_id,
             "status": "error",
             "error": str(e),
+            "error_source": error_source,
             "elapsed": round(elapsed, 1),
         }
 
@@ -767,6 +782,7 @@ async def run_batch(
                     "request_id": "",
                     "status": "timeout",
                     "error": f"Client-side timeout after {client_timeout}s",
+                    "error_source": "client_timeout",
                     "elapsed": round(elapsed, 1),
                 }
 
@@ -816,12 +832,14 @@ async def run_batch(
                     real_success = True
             except Exception as e:
                 logger.warning(
-                    "[%d/%d] VALIDATE ERROR %s: %s",
+                    "[%d/%d] VALIDATE ERROR [validation_server] %s: %s",
                     idx + 1,
                     total,
                     task_id,
                     e,
                 )
+                result["validation_error"] = str(e)
+                result["validation_error_source"] = "validation_server"
                 real_success = poc_found
 
             if memrl:
@@ -897,11 +915,21 @@ def print_summary(results: list[dict[str, Any]], elapsed: float) -> dict[str, An
         r.get("metrics", {}).get("tokens", {}).get("output", 0) for r in results
     )
 
+    # Error source breakdown
+    error_sources: dict[str, int] = {}
+    for r in results:
+        src = r.get("error_source")
+        if src:
+            error_sources[src] = error_sources.get(src, 0) + 1
+    n_validation_errors = sum(1 for r in results if r.get("validation_error_source"))
+
     summary: dict[str, Any] = {
         "total_tasks": n_total,
         "completed": n_completed,
         "timeout": n_timeout,
         "error": n_error,
+        "error_sources": error_sources,
+        "validation_errors": n_validation_errors,
         "poc_found": n_poc_found,
         "poc_rate": round(n_poc_found / max(n_total, 1) * 100, 2),
         "validated": n_validated,
@@ -930,6 +958,11 @@ def print_summary(results: list[dict[str, Any]], elapsed: float) -> dict[str, An
         f"  Tasks:       {n_completed}/{n_total} completed, "
         f"{n_timeout} timeout, {n_error} error"
     )
+    if error_sources:
+        parts = [f"{src}={cnt}" for src, cnt in sorted(error_sources.items())]
+        print(f"  Error src:   {', '.join(parts)}")
+    if n_validation_errors:
+        print(f"  Val errors:  {n_validation_errors} (validation_server)")
     print(f"  PoC Found:   {n_poc_found}/{n_total} ({summary['poc_rate']}%)")
     if n_validated:
         print(
