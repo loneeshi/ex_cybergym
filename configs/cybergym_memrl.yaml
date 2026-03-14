@@ -1,0 +1,62 @@
+# CyberGym + MEMRL Configuration
+# API keys are read from environment variables:
+#   - SII_API_KEY or INF_API_KEY for LLM
+#   - SILICONFLOW_KEY or INF_API_KEY for embedding
+
+llm:
+  provider: "openai"
+  api_key: "REPLACE_ME"
+  base_url: "https://holos.openapi-qb.sii.edu.cn/v1"
+  model: "qwen3.5-397b-a17b"
+  temperature: 0.3
+  max_tokens: 4096
+
+embedding:
+  provider: "openai"
+  api_key: "REPLACE_ME"
+  base_url: "https://og5o9mjcdgckcmejjobdgmjh9ddcjcmk.openapi-qb.sii.edu.cn/v1"
+  model: "qwen3-embedding-8b"
+  max_text_len: 4096
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 3
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.90
+  user_id: "cybergym_user"
+  sim_norm_mean: 0.1856827586889267
+  sim_norm_std: 0.09407906234264374
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  experiment_name: "cybergym_memrl"
+  enable_value_driven: true
+  mode: "train"
+  num_sections: 5
+  batch_size: 1
+  dataset_ratio: 1.0
+  train_valid_split: 1.0
+  output_dir: "./results/memrl"
+  save_trajectories: true
+  save_memories: true
+
+rl_config:
+  epsilon: 0.1
+  tau: 0.25
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0.0
+  q_init_neg: 0.0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  weight_sim: 0.5
+  weight_q: 0.5

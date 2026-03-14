@@ -1,0 +1,13 @@
+--- a/benchmark/server.py
++++ b/benchmark/server.py
+@@ -62,7 +62,10 @@ BENCHMARK_DIR = Path(__file__).resolve().parent
+ 
+ registry = ProviderRegistry()
+-workspaces = WorkspaceManager(BENCHMARK_DIR / "workspaces")
++# Use a directory outside the git repo for workspaces so Synergy's
++# Scope.fromDirectory() doesn't walk up to the git root and override
++# the workspace CWD.
++workspaces = WorkspaceManager(Path(os.environ.get("BENCHMARK_WORKSPACE_ROOT", "/tmp/synergy-benchmark-workspaces")))
+ runner = SynergyRunner()
+ 
+ 
