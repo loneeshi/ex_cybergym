@@ -139,8 +139,15 @@ may help guide your approach:
 def _extract_session_trajectory(session_path: Path, max_chars: int = 6000) -> str:
     """Extract condensed trajectory from a saved session file for MEMRL.
 
-    Pulls agent reasoning (assistant text) and key actions (tool calls +
+    Pulls agent reasoning, analysis text, and key actions (tool calls +
     abbreviated results) to create useful experience for memory building.
+
+    Session part types from Synergy storage:
+      - "reasoning" → agent's chain-of-thought (part["text"])
+      - "text"      → agent's visible analysis text (part["text"])
+      - "tool"      → tool call + result bundled (part["tool"], part["state"])
+      - "patch"     → file edits (ignored for trajectory)
+      - "step-start"/"step-finish" → step boundaries (ignored)
     """
     try:
         session_data = json.loads(session_path.read_text())
@@ -159,29 +166,52 @@ def _extract_session_trajectory(session_path: Path, max_chars: int = 6000) -> st
         for part in msg.get("parts", []):
             ptype = part.get("type", "")
 
-            if ptype == "text" and role == "assistant":
-                text = part.get("content", "").strip()
+            # Agent reasoning (chain-of-thought)
+            if ptype == "reasoning" and role == "assistant":
+                text = part.get("text", "").strip()
+                if text:
+                    if len(text) > 800:
+                        text = text[:400] + "\n...[truncated]...\n" + text[-400:]
+                    parts_out.append(f"[REASONING]\n{text}")
+                    total_len += len(parts_out[-1])
+
+            # Agent visible text / analysis
+            elif ptype == "text" and role == "assistant":
+                text = part.get("text", part.get("content", "")).strip()
                 if text:
                     if len(text) > 800:
                         text = text[:400] + "\n...[truncated]...\n" + text[-400:]
                     parts_out.append(f"[ANALYSIS]\n{text}")
                     total_len += len(parts_out[-1])
 
-            elif ptype == "tool-call":
-                tool = part.get("tool", "?")
-                tool_input = part.get("input", {})
-                cmd = (
-                    tool_input.get("command", "")
-                    if isinstance(tool_input, dict)
-                    else str(tool_input)
-                )
+            # Tool call + result (bundled in Synergy storage format)
+            elif ptype == "tool" and role == "assistant":
+                tool_name = part.get("tool", "?")
+                state = part.get("state", {})
+                if not isinstance(state, dict):
+                    continue
+
+                # Extract input (command for bash, filePath for read, etc.)
+                tool_input = state.get("input", {})
+                if isinstance(tool_input, dict):
+                    cmd = (
+                        tool_input.get("command", "")
+                        or tool_input.get("filePath", "")
+                        or tool_input.get("content", "")
+                        or json.dumps(tool_input, ensure_ascii=False)[:200]
+                    )
+                else:
+                    cmd = str(tool_input)
                 if cmd:
                     cmd_short = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                    parts_out.append(f"[TOOL] {tool}: {cmd_short}")
+                    parts_out.append(f"[TOOL] {tool_name}: {cmd_short}")
                     total_len += len(parts_out[-1])
 
-            elif ptype == "tool-result":
-                output = part.get("output", "")
+                # Extract output
+                output = state.get("output", "")
+                if isinstance(output, dict):
+                    output = json.dumps(output, ensure_ascii=False)
+                output = str(output)
                 if output and len(output) > 300:
                     output = output[:150] + "...[truncated]..." + output[-150:]
                 if output:
@@ -851,6 +881,7 @@ async def run_batch(
                     f"## Task: {task_id}\n"
                     f"Project: {instance.get('project_name', '?')} "
                     f"({instance.get('project_language', '?')})\n"
+                    f"Crash type: {instance.get('crash_type', '?')}\n"
                     f"Status: {result.get('status')} | PoC found: {poc_found} | "
                     f"Validation passed: {real_success}\n"
                     f"Vul exit code: {result.get('vul_exit_code', 'N/A')} | "
@@ -861,6 +892,22 @@ async def run_batch(
                     trajectory_summary += (
                         f"\n## Agent Problem-Solving Trajectory\n{session_trajectory}\n"
                     )
+                else:
+                    # Fallback: no session data (connection error, timeout, etc.)
+                    # Record what we know so MEMRL can still learn from the outcome
+                    err = result.get("error", "")
+                    err_src = result.get("error_source", "")
+                    fallback_parts = ["\n## No Session Data Available"]
+                    if err_src:
+                        fallback_parts.append(f"Error source: {err_src}")
+                    if err:
+                        fallback_parts.append(f"Error: {err[:500]}")
+                    fallback_parts.append(f"Elapsed: {result.get('elapsed', 0)}s")
+                    fallback_parts.append(
+                        "Note: Agent trajectory unavailable due to connection "
+                        "failure. Only task outcome is recorded."
+                    )
+                    trajectory_summary += "\n".join(fallback_parts) + "\n"
 
                 memrl.build(
                     task_description=(instance.get("vulnerability_description", "")),
@@ -872,6 +919,7 @@ async def run_batch(
                         "success": real_success,
                         "validated": validated,
                         "level": level,
+                        "has_trajectory": bool(session_trajectory),
                     },
                 )
 
