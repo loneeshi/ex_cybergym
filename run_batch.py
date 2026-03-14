@@ -42,8 +42,8 @@ DEFAULT_SERVER = "http://localhost:8000"
 DEFAULT_MODEL = "sii-holos/Qwen 3.5 397B A17B"
 DEFAULT_LEVEL = "level1"
 DEFAULT_CONCURRENCY = 16
-DEFAULT_TIMEOUT = 600
-DEFAULT_STEP_LIMIT = 150
+DEFAULT_TIMEOUT = 1800  # 30min safety net; step_limit is the real constraint
+DEFAULT_STEP_LIMIT = 100  # matches CyberGym paper (100 iterations)
 
 # ── Prompt templates ────────────────────────────────────────────────────────
 
