@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ── Defaults ────────────────────────────────────────────────────────────────
 
 DEFAULT_SERVER = "http://localhost:8000"
-DEFAULT_MODEL = "sii-holos/Qwen 3.5 397B A17B"
+DEFAULT_MODEL = "sii-nex/Nex N1.1"
 DEFAULT_LEVEL = "level1"
 DEFAULT_CONCURRENCY = 16
 DEFAULT_TIMEOUT = 1800  # 30min safety net; step_limit is the real constraint
