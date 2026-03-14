@@ -414,6 +414,10 @@ class MemRLHelper:
     def retrieve(self, query: str) -> tuple[str, list[str]]:
         """Retrieve relevant memories and format as prompt context.
 
+        When value-driven RL is enabled, uses retrieve_query() for hybrid
+        similarity+Q-value ranking with ε-greedy exploration.
+        Otherwise falls back to pure similarity retrieval.
+
         Returns:
             (formatted_prompt_text, list_of_retrieved_memory_ids)
         """
@@ -422,20 +426,53 @@ class MemRLHelper:
         try:
             k = getattr(self.config.memory, "k_retrieve", 3)
             threshold = getattr(self.config.memory, "confidence_threshold", 0.0)
-            memories = self.service.retrieve(query, k=k, threshold=threshold)
-            if not memories:
-                return "", []
-            memory_ids = [
-                mem["memory_id"]
-                for mem in memories
-                if mem.get("memory_id") and mem["memory_id"] != "unknown"
-            ]
+
+            use_value_driven = (
+                getattr(self.service, "enable_value_driven", False)
+                and hasattr(self.service, "retrieve_query")
+                and getattr(self.service, "dict_memory", None)
+            )
+
+            if use_value_driven:
+                results = self.service.retrieve_query(
+                    task_description=query,
+                    k=k,
+                    threshold=threshold,
+                )
+                if isinstance(results, tuple):
+                    selected = results[0].get("selected", [])
+                else:
+                    selected = (
+                        results.get("selected", []) if isinstance(results, dict) else []
+                    )
+                if not selected:
+                    return "", []
+                memory_ids = [
+                    mem["memory_id"]
+                    for mem in selected
+                    if mem.get("memory_id") and mem["memory_id"] != "unknown"
+                ]
+                memories = selected
+            else:
+                memories = self.service.retrieve(query, k=k, threshold=threshold)
+                if not memories:
+                    return "", []
+                memory_ids = [
+                    mem["memory_id"]
+                    for mem in memories
+                    if mem.get("memory_id") and mem["memory_id"] != "unknown"
+                ]
+
             parts = []
             for i, mem in enumerate(memories, 1):
                 content = mem.get("content", mem.get("full_content", ""))
+                if not content:
+                    continue
                 if len(content) > 2000:
                     content = content[:2000] + "\n... (truncated)"
                 parts.append(f"[Experience {i}]\n{content}")
+            if not parts:
+                return "", memory_ids
             text = MEMORY_CONTEXT_TEMPLATE.format(memories="\n\n".join(parts))
             return text, memory_ids
         except Exception as e:
@@ -465,15 +502,40 @@ class MemRLHelper:
     def build(
         self, task_description: str, trajectory: str, metadata: dict[str, Any]
     ) -> None:
-        """Build memory from a completed task."""
+        """Build memory from a completed task.
+
+        Also registers the new memory in dict_memory/query_embeddings so that
+        retrieve_query() (value-driven hybrid retrieval) can find it.
+        build_memory() alone only writes to MemOS but does NOT populate the
+        in-process caches that retrieve_query() depends on.
+        """
         if not self.service:
             return
         try:
-            self.service.build_memory(
+            mem_id = self.service.build_memory(
                 task_description=task_description,
                 trajectory=trajectory,
                 metadata=metadata,
             )
+            # Register in dict_memory so retrieve_query() can find this memory.
+            # build_memory writes to MemOS/Qdrant but skips dict_memory (only
+            # add_memories populates it). Without this, retrieve_query() sees
+            # an empty dict_memory and returns nothing.
+            if mem_id and hasattr(self.service, "dict_memory"):
+                dm = self.service.dict_memory
+                if task_description in dm:
+                    dm[task_description].append(mem_id)
+                else:
+                    dm[task_description] = [mem_id]
+                # Cache the query embedding for retrieve_query's similarity calc
+                embedder = getattr(self.service, "embedding_provider", None)
+                qe = getattr(self.service, "query_embeddings", None)
+                if embedder and qe is not None and task_description not in qe:
+                    try:
+                        vec = embedder.embed([task_description])[0]
+                        qe[task_description] = vec
+                    except Exception:
+                        pass
         except Exception as e:
             logger.warning("Memory build failed: %s", e)
 
