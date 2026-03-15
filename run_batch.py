@@ -930,11 +930,14 @@ async def run_batch(
     memrl: Optional[MemRLHelper] = None,
     cybergym_server: Optional[str] = None,
     checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
+    memrl_build_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Run all tasks with bounded concurrency.
 
-    If cybergym_server is provided and memrl is enabled, each PoC is validated
-    inline and the real pass/fail is used as the MEMRL reward signal.
+    If cybergym_server is provided, each PoC is validated inline.
+    If memrl is provided, memories are built after each task completes.
+    Set memrl_build_only=True to build memories without retrieving
+    (useful for Round 1 where no prior memories exist).
     """
     import aiohttp
 
@@ -953,7 +956,7 @@ async def run_batch(
 
             memory_context = ""
             retrieved_ids: list[str] = []
-            if memrl:
+            if memrl and not memrl_build_only:
                 query = (
                     f"{instance.get('vulnerability_description', '')} "
                     f"{instance.get('crash_type', '')}"

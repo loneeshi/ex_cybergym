@@ -324,6 +324,7 @@ async def run_single_round(
     output_dir: Path,
     memrl: Optional[MemRLHelper],
     cybergym_server: Optional[str] = None,
+    memrl_build_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Execute a single round — thin wrapper around run_batch."""
     return await run_batch(
@@ -338,6 +339,7 @@ async def run_single_round(
         output_dir=output_dir,
         memrl=memrl,
         cybergym_server=cybergym_server,
+        memrl_build_only=memrl_build_only,
     )
 
 
@@ -541,8 +543,9 @@ def run_evolution(
                         timeout=timeout,
                         step_limit=step_limit,
                         output_dir=round_dir,
-                        memrl=None,
+                        memrl=memrl_helper,
                         cybergym_server=cybergym_server,
+                        memrl_build_only=True,
                     )
                 )
             else:
@@ -573,111 +576,6 @@ def run_evolution(
 
         # Print per-round summary (reuse existing function)
         print_summary(results, round_elapsed)
-
-        # ── Round 1: build MEMRL memories from already-validated results ──
-        # (Validation already happened inline during the batch via cybergym_server)
-        logger.info(
-            "DEBUG: round_num=%d, memrl_helper=%s (type=%s)",
-            round_num,
-            memrl_helper is not None,
-            type(memrl_helper).__name__,
-        )
-        if round_num == 1 and memrl_helper:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            logger.info(
-                "Round 1: building MEMRL memories from %d results (concurrent)...",
-                len(results),
-            )
-            n_built = 0
-            n_build_failed = 0
-            built_mem_ids: list[str] = []
-            built_successes: list[float] = []
-
-            def _build_one(r):
-                poc_found = r.get("poc_found", False)
-                task_id = r.get("task_id", "")
-                real_success = r.get("validation_passed", poc_found)
-
-                base_tid = task_id.split("/")[0] if "/" in task_id else task_id
-                inst = instances.get(base_tid, {})
-
-                # Build rich trajectory from session data
-                safe_name = task_id.replace("/", "__").replace(":", "_")
-                session_file = round_dir / "sessions" / f"{safe_name}.json"
-                session_trajectory = _extract_session_trajectory(session_file)
-
-                trajectory_summary = (
-                    f"## Task: {task_id}\n"
-                    f"Project: {inst.get('project_name', '?')} ({inst.get('project_language', '?')})\n"
-                    f"Status: {r.get('status')} | PoC found: {poc_found} | "
-                    f"Validation passed: {real_success}\n"
-                    f"Vul exit code: {r.get('vul_exit_code', 'N/A')} | "
-                    f"Fix exit code: {r.get('fix_exit_code', 'N/A')}\n"
-                    f"Steps: {r.get('metrics', {}).get('step_count', 0)}\n"
-                )
-                if session_trajectory:
-                    trajectory_summary += (
-                        f"\n## Agent Problem-Solving Trajectory\n{session_trajectory}\n"
-                    )
-                else:
-                    trajectory_summary += (
-                        "\n(No session data available — task may have "
-                        "errored before agent started)\n"
-                    )
-                mem_id = memrl_helper.build(
-                    task_description=inst.get("vulnerability_description", ""),
-                    trajectory=trajectory_summary,
-                    metadata={
-                        "source": "cybergym",
-                        "task_id": task_id,
-                        "project": inst.get("project_name", ""),
-                        "success": real_success,
-                        "validated": r.get("validation_passed") is not None,
-                        "level": level,
-                    },
-                )
-                return mem_id, real_success
-
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = {executor.submit(_build_one, r): r for r in results}
-                for future in as_completed(futures):
-                    try:
-                        mem_id, success = future.result()
-                        n_built += 1
-                        if mem_id:
-                            built_mem_ids.append(mem_id)
-                            built_successes.append(1.0 if success else 0.0)
-                    except Exception as e:
-                        n_build_failed += 1
-                        task_id = futures[future].get("task_id", "?")
-                        if n_build_failed <= 3:
-                            logger.warning("Memory build failed for %s: %s", task_id, e)
-
-            logger.info(
-                "Round 1 memory build done: %d/%d built, %d failed",
-                n_built,
-                len(results),
-                n_build_failed,
-            )
-
-            # Batch Q-value update: apply Q-learning with known outcomes
-            # for all memories built in Round 1.
-            # Q = (1-alpha)*0 + alpha*reward → 0.3 (success) or -0.3 (failure)
-            if built_mem_ids:
-                memrl_helper.update_values(
-                    built_successes,
-                    [[mid] for mid in built_mem_ids],
-                )
-                n_pos = sum(1 for s in built_successes if s > 0)
-                n_neg = len(built_successes) - n_pos
-                logger.info(
-                    "Round 1 batch Q-value update: %d memories "
-                    "(%d success → Q≈0.3, %d failure → Q≈-0.3)",
-                    len(built_mem_ids),
-                    n_pos,
-                    n_neg,
-                )
 
         # Save MEMRL checkpoint for next round
         if memrl_helper:
