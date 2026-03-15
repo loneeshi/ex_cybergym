@@ -13,3 +13,5 @@ cybergym_dataset.json
 *.sqlite
 **/qdrant/**/.lock
 *.txt
+*.json
+results/

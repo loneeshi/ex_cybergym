@@ -22,6 +22,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -316,6 +317,7 @@ class MemRLHelper:
     def __init__(self, config_path: str, checkpoint_path: str | None = None):
         self.service = None
         self.config = None
+        self._state_lock = threading.Lock()
         self._init(config_path, checkpoint_path)
 
     def _init(self, config_path: str, checkpoint_path: str | None) -> None:
@@ -533,7 +535,8 @@ class MemRLHelper:
         if not self.service:
             return
         try:
-            result = self.service.update_values(successes, retrieved_ids_list)
+            with self._state_lock:
+                result = self.service.update_values(successes, retrieved_ids_list)
             n_updated = (
                 sum(1 for v in result.values() if v is not None) if result else 0
             )
@@ -568,20 +571,28 @@ class MemRLHelper:
             # add_memories populates it). Without this, retrieve_query() sees
             # an empty dict_memory and returns nothing.
             if mem_id and hasattr(self.service, "dict_memory"):
-                dm = self.service.dict_memory
-                if task_description in dm:
-                    dm[task_description].append(mem_id)
-                else:
-                    dm[task_description] = [mem_id]
-                # Cache the query embedding for retrieve_query's similarity calc
+                # Pre-compute embedding outside lock (network call may be slow)
+                _new_vec = None
                 embedder = getattr(self.service, "embedding_provider", None)
                 qe = getattr(self.service, "query_embeddings", None)
                 if embedder and qe is not None and task_description not in qe:
                     try:
-                        vec = embedder.embed([task_description])[0]
-                        qe[task_description] = vec
+                        _new_vec = embedder.embed([task_description])[0]
                     except Exception:
                         pass
+
+                with self._state_lock:
+                    dm = self.service.dict_memory
+                    if task_description in dm:
+                        dm[task_description].append(mem_id)
+                    else:
+                        dm[task_description] = [mem_id]
+                    if (
+                        _new_vec is not None
+                        and qe is not None
+                        and task_description not in qe
+                    ):
+                        qe[task_description] = _new_vec
             return mem_id
         except Exception as e:
             logger.warning("Memory build failed: %s", e)
@@ -592,7 +603,10 @@ class MemRLHelper:
         if not self.service:
             return
         try:
-            self.service.save_checkpoint_snapshot(target_ck_dir=path, ckpt_id=ckpt_id)
+            with self._state_lock:
+                self.service.save_checkpoint_snapshot(
+                    target_ck_dir=path, ckpt_id=ckpt_id
+                )
             logger.info("MEMRL checkpoint saved to %s", path)
         except Exception as e:
             logger.warning("Checkpoint save failed: %s", e)

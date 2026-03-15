@@ -74,10 +74,10 @@ from run_batch import (
 )
 
 
-# ── Round 1 intra-round resume ───────────────────────────────────────────────
+# ── Intra-round resume helpers ────────────────────────────────────────────
 
 
-def _load_completed_round1_tasks(
+def _load_completed_round_tasks(
     round_dir: Path,
     valid_task_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], set[str]]:
@@ -115,6 +115,79 @@ def _load_completed_round1_tasks(
             logger.warning("Failed to read task file %s: %s", f, e)
 
     return completed, completed_ids
+
+
+def _replay_memrl_for_completed_tasks(
+    completed_results: list[dict[str, Any]],
+    sessions_dir: Path,
+    instances: dict[str, dict[str, Any]],
+    memrl: MemRLHelper,
+) -> int:
+    """Replay MEMRL build for previously completed tasks during intra-round resume.
+
+    When resuming a partially completed round, tasks that finished before the
+    crash already have results on disk, but their MEMRL memories were lost with
+    the process.  This rebuilds those memories so the round-end checkpoint is
+    complete.
+
+    NOTE: Q-value updates for *retrieved* memories from the original run cannot
+    be replayed (retrieved IDs are not persisted).  Only the newly built memory's
+    self-update is replayed.  This causes minor Q-value drift — acceptable given
+    the alternative of losing all memories for skipped tasks.
+
+    Returns:
+        Number of memories successfully built.
+    """
+    n_built = 0
+    for r in completed_results:
+        task_id = r.get("task_id", "")
+        base_tid = task_id.split("/")[0] if "/" in task_id else task_id
+        instance = instances.get(base_tid, {})
+
+        safe_name = task_id.replace("/", "__").replace(":", "_")
+        session_file = sessions_dir / f"{safe_name}.json"
+        session_trajectory = _extract_session_trajectory(session_file)
+
+        poc_found = r.get("poc_found", False)
+        real_success = r.get("validation_passed", poc_found)
+
+        trajectory_summary = (
+            f"## Task: {task_id}\n"
+            f"Project: {instance.get('project_name', '?')} "
+            f"({instance.get('project_language', '?')})\n"
+            f"Crash type: {instance.get('crash_type', '?')}\n"
+            f"Status: {r.get('status')} | PoC found: {poc_found} | "
+            f"Validation passed: {real_success}\n"
+            f"Vul exit code: {r.get('vul_exit_code', 'N/A')} | "
+            f"Fix exit code: {r.get('fix_exit_code', 'N/A')}\n"
+            f"Steps: {r.get('metrics', {}).get('step_count', 0)}\n"
+        )
+        if session_trajectory:
+            trajectory_summary += (
+                f"\n## Agent Problem-Solving Trajectory\n{session_trajectory}\n"
+            )
+
+        mem_id = memrl.build(
+            task_description=instance.get("vulnerability_description", ""),
+            trajectory=trajectory_summary,
+            metadata={
+                "source": "cybergym",
+                "task_id": task_id,
+                "project": instance.get("project_name", ""),
+                "success": real_success,
+                "validated": r.get("validation_passed") is not None,
+                "level": task_id.split("/")[-1] if "/" in task_id else "level1",
+                "replayed": True,
+            },
+        )
+        if mem_id:
+            memrl.update_values(
+                [1.0 if real_success else 0.0],
+                [[mem_id]],
+            )
+            n_built += 1
+
+    return n_built
 
 
 # ── Evolution orchestrator ──────────────────────────────────────────────────
@@ -407,6 +480,34 @@ def run_evolution(
             if prev_summary_file.exists():
                 round_summaries.append(json.loads(prev_summary_file.read_text()))
 
+        # ── Warn if key parameters differ from the original run ──
+        prev_config_file = base_output_dir / "evolution_config.json"
+        if prev_config_file.exists():
+            try:
+                prev_cfg = json.loads(prev_config_file.read_text())
+                mismatches: list[str] = []
+                if prev_cfg.get("model") != model:
+                    mismatches.append(f"model: {prev_cfg.get('model')} → {model}")
+                if prev_cfg.get("level") != level:
+                    mismatches.append(f"level: {prev_cfg.get('level')} → {level}")
+                if prev_cfg.get("num_tasks") != total_tasks:
+                    mismatches.append(
+                        f"num_tasks: {prev_cfg.get('num_tasks')} → {total_tasks}"
+                    )
+                if prev_cfg.get("step_limit") != step_limit:
+                    mismatches.append(
+                        f"step_limit: {prev_cfg.get('step_limit')} → {step_limit}"
+                    )
+                if prev_cfg.get("timeout") != timeout:
+                    mismatches.append(f"timeout: {prev_cfg.get('timeout')} → {timeout}")
+                if mismatches:
+                    logger.warning(
+                        "Resume parameter mismatch with previous run:\n  %s",
+                        "\n  ".join(mismatches),
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+
     # ── Save evolution config ──
     evo_config = {
         "server": server,
@@ -495,7 +596,7 @@ def run_evolution(
         round_t0 = time.monotonic()
         if round_num == 1:
             # ── Round 1 intra-round resume: skip already-completed tasks ──
-            prev_completed, prev_completed_ids = _load_completed_round1_tasks(
+            prev_completed, prev_completed_ids = _load_completed_round_tasks(
                 round_dir, valid_task_ids=set(task_ids)
             )
             remaining_task_ids = [
@@ -509,6 +610,24 @@ def run_evolution(
                     len(remaining_task_ids),
                     len(task_ids) - len(prev_completed) - len(remaining_task_ids),
                 )
+                # Replay MEMRL build for completed tasks so round-end checkpoint
+                # includes all memories (not just those from newly run tasks).
+                if memrl_helper:
+                    logger.info(
+                        "Replaying MEMRL build for %d previously completed tasks...",
+                        len(prev_completed),
+                    )
+                    n_replayed = _replay_memrl_for_completed_tasks(
+                        prev_completed,
+                        round_dir / "sessions",
+                        instances,
+                        memrl_helper,
+                    )
+                    logger.info(
+                        "MEMRL replay: %d/%d memories rebuilt",
+                        n_replayed,
+                        len(prev_completed),
+                    )
 
             if remaining_task_ids:
                 logger.info(
@@ -541,22 +660,63 @@ def run_evolution(
             results = prev_completed + new_results
         else:
             # Round 2+: memrl retrieves memories, inline validation for reward
-            results = asyncio.run(
-                run_single_round(
-                    round_num=round_num,
-                    server=server,
-                    task_ids=task_ids,
-                    instances=instances,
-                    model=model,
-                    level=level,
-                    concurrency=concurrency,
-                    timeout=timeout,
-                    step_limit=step_limit,
-                    output_dir=round_dir,
-                    memrl=memrl_helper,
-                    cybergym_server=cybergym_server,
-                )
+            # ── Intra-round resume: skip already-completed tasks ──
+            prev_completed, prev_completed_ids = _load_completed_round_tasks(
+                round_dir, valid_task_ids=set(task_ids)
             )
+            remaining_task_ids = [
+                tid for tid in task_ids if tid not in prev_completed_ids
+            ]
+            if prev_completed:
+                logger.info(
+                    "Round %d resume: %d tasks already completed, %d remaining",
+                    round_num,
+                    len(prev_completed),
+                    len(remaining_task_ids),
+                )
+                # Replay MEMRL build for completed tasks
+                if memrl_helper:
+                    logger.info(
+                        "Replaying MEMRL build for %d previously completed tasks...",
+                        len(prev_completed),
+                    )
+                    n_replayed = _replay_memrl_for_completed_tasks(
+                        prev_completed,
+                        round_dir / "sessions",
+                        instances,
+                        memrl_helper,
+                    )
+                    logger.info(
+                        "MEMRL replay: %d/%d memories rebuilt",
+                        n_replayed,
+                        len(prev_completed),
+                    )
+
+            if remaining_task_ids:
+                new_results = asyncio.run(
+                    run_single_round(
+                        round_num=round_num,
+                        server=server,
+                        task_ids=remaining_task_ids,
+                        instances=instances,
+                        model=model,
+                        level=level,
+                        concurrency=concurrency,
+                        timeout=timeout,
+                        step_limit=step_limit,
+                        output_dir=round_dir,
+                        memrl=memrl_helper,
+                        cybergym_server=cybergym_server,
+                    )
+                )
+            else:
+                new_results = []
+                logger.info(
+                    "Round %d: all tasks already completed — skipping batch",
+                    round_num,
+                )
+
+            results = prev_completed + new_results
         round_elapsed = time.monotonic() - round_t0
 
         # Print per-round summary (reuse existing function)
