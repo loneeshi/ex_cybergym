@@ -914,6 +914,9 @@ async def solve_one(
 # ── Batch runner ────────────────────────────────────────────────────────────
 
 
+DEFAULT_CHECKPOINT_INTERVAL = 100
+
+
 async def run_batch(
     server: str,
     task_ids: list[str],
@@ -926,6 +929,7 @@ async def run_batch(
     output_dir: Path,
     memrl: Optional[MemRLHelper] = None,
     cybergym_server: Optional[str] = None,
+    checkpoint_interval: int = DEFAULT_CHECKPOINT_INTERVAL,
 ) -> list[dict[str, Any]]:
     """Run all tasks with bounded concurrency.
 
@@ -1145,8 +1149,9 @@ async def run_batch(
     retry_overhead = sum(RETRY_DELAYS[:DEFAULT_MAX_RETRIES]) + 60
     client_timeout = aiohttp.ClientTimeout(total=timeout + 120 + retry_overhead)
 
-    # Periodic progress reporter
+    # Periodic progress reporter + checkpoint saver
     _progress_count = {"done": 0, "ok": 0, "err": 0, "t0": time.monotonic()}
+    _checkpoint_lock = asyncio.Lock()
 
     def _log_progress(result: dict):
         _progress_count["done"] += 1
@@ -1170,9 +1175,26 @@ async def run_batch(
                 eta / 60,
             )
 
+    async def _maybe_checkpoint(done: int):
+        """Save MEMRL checkpoint periodically to avoid losing memories on crash."""
+        if not memrl or checkpoint_interval <= 0:
+            return
+        if done % checkpoint_interval != 0:
+            return
+        async with _checkpoint_lock:
+            ckpt_dir = str(output_dir / "memrl_checkpoint")
+            logger.info(
+                "Periodic MEMRL checkpoint at %d/%d tasks → %s",
+                done,
+                total,
+                ckpt_dir,
+            )
+            await asyncio.to_thread(memrl.save_checkpoint, ckpt_dir)
+
     async def _tracked_solve(tid, idx):
         result = await bounded_solve(tid, idx)
         _log_progress(result)
+        await _maybe_checkpoint(_progress_count["done"])
         return result
 
     async with aiohttp.ClientSession(
