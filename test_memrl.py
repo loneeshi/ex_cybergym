@@ -105,16 +105,20 @@ def main():
     )
     logger.info("MEMRL initialized")
 
-    # ── Phase 1: Build memories from results ──
+    # ── Phase 1: Build memories from results (concurrent) ──
     print("\n" + "=" * 60)
     print("Phase 1: Building memories from task results")
     print("=" * 60)
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     built_mem_ids: list[str] = []
     built_successes: list[float] = []
     build_details: list[dict[str, Any]] = []
+    n_built = 0
+    n_build_failed = 0
 
-    for i, r in enumerate(results):
+    def _build_one(i: int, r: dict[str, Any]) -> dict[str, Any]:
         task_id = r.get("task_id", "")
         base_tid = task_id.split("/")[0] if "/" in task_id else task_id
         inst = instances.get(base_tid, {})
@@ -176,24 +180,34 @@ def main():
             build_time,
         )
 
-        if mem_id:
-            built_mem_ids.append(mem_id)
-            built_successes.append(1.0 if real_success else 0.0)
+        return {
+            "task_id": task_id,
+            "mem_id": mem_id,
+            "success": real_success,
+            "has_trajectory": bool(session_trajectory),
+            "build_time": round(build_time, 2),
+        }
 
-        build_details.append(
-            {
-                "task_id": task_id,
-                "mem_id": mem_id,
-                "success": real_success,
-                "has_trajectory": bool(session_trajectory),
-                "build_time": round(build_time, 2),
-            }
-        )
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_build_one, i, r): r for i, r in enumerate(results)}
+        for future in as_completed(futures):
+            try:
+                detail = future.result()
+                build_details.append(detail)
+                if detail["mem_id"]:
+                    built_mem_ids.append(detail["mem_id"])
+                    built_successes.append(1.0 if detail["success"] else 0.0)
+                    n_built += 1
+                else:
+                    n_build_failed += 1
+            except Exception as e:
+                n_build_failed += 1
+                task_id = futures[future].get("task_id", "?")
+                logger.warning("Memory build failed for %s: %s", task_id, e)
 
-    n_built = len(built_mem_ids)
     n_success = sum(1 for s in built_successes if s > 0)
     n_failure = n_built - n_success
-    print(f"\n  Built: {n_built}/{len(results)} memories")
+    print(f"\n  Built: {n_built}/{len(results)} memories ({n_build_failed} failed)")
     print(f"  Success: {n_success}, Failure: {n_failure}")
 
     # ── Phase 2: Update Q-values ──
