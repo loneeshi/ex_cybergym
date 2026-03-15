@@ -12,3 +12,4 @@ holos_synergy
 cybergym_dataset.json
 *.sqlite
 **/qdrant/**/.lock
+*.txt

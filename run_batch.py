@@ -699,6 +699,33 @@ def _safe_task_name(task_id: str) -> str:
     return task_id.replace("/", "__").replace(":", "_")
 
 
+def _is_retryable_error(result: dict[str, Any]) -> bool:
+    """Determine whether a failed result is worth retrying.
+
+    Retryable: server-side 500 errors (setup/cleanup timeout, worker crash).
+    NOT retryable: task ran to completion (completed/timeout with session),
+    client-side network failures, or 4xx errors (bad request / not found).
+    """
+    if result.get("status") != "error":
+        return False
+    error = result.get("error", "")
+    source = result.get("error_source", "")
+    if source in ("network", "client_timeout"):
+        return False
+    if "HTTP 4" in error:
+        return False
+    if "HTTP 5" in error or "Workspace setup failed" in error:
+        return True
+    if source == "benchmark_server":
+        return True
+    return False
+
+
+# Retry delays (seconds) for each attempt: attempt 1 → 10s, attempt 2 → 30s, attempt 3 → 60s
+RETRY_DELAYS = [10, 30, 60]
+DEFAULT_MAX_RETRIES = 3
+
+
 async def solve_one(
     session: Any,
     server: str,
@@ -711,129 +738,177 @@ async def solve_one(
     idx: int,
     total: int,
     memory_context: str = "",
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> dict[str, Any]:
-    """Send a single solve request and return the full response."""
+    """Send a single solve request and return the full response.
+
+    Retries up to *max_retries* times on server-side errors (HTTP 500,
+    workspace setup failures) which are typically caused by transient
+    worker issues.  Non-retryable results (completed tasks, 404, network
+    errors) are returned immediately.
+    """
     full_task_id = f"{task_id}/{level}" if "/" not in task_id else task_id
-    request_id = f"batch-{uuid.uuid4().hex[:12]}"
+    project = instance.get("project_name", "?")
 
     user_prompt = build_user_prompt(instance, level, memory_context)
 
-    payload = {
-        "request_id": request_id,
-        "benchmark": "cybergym",
-        "task_id": full_task_id,
-        "model": model,
-        "include_task_prompt": False,
-        "user_prompt": user_prompt,
-        "system_prompt": SYSTEM_PROMPT,
-        "timeout": timeout,
-        "step_limit": step_limit,
-    }
+    last_result: dict[str, Any] | None = None
 
-    t0 = time.monotonic()
-    project = instance.get("project_name", "?")
-    logger.info("[%d/%d] START  %s (%s)", idx + 1, total, full_task_id, project)
+    for attempt in range(1 + max_retries):
+        request_id = f"batch-{uuid.uuid4().hex[:12]}"
 
-    try:
-        async with session.post(
-            f"{server}/task/solve",
-            json=payload,
-            timeout=None,
-        ) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
+        payload = {
+            "request_id": request_id,
+            "benchmark": "cybergym",
+            "task_id": full_task_id,
+            "model": model,
+            "include_task_prompt": False,
+            "user_prompt": user_prompt,
+            "system_prompt": SYSTEM_PROMPT,
+            "timeout": timeout,
+            "step_limit": step_limit,
+        }
+
+        retry_tag = f" (retry {attempt}/{max_retries})" if attempt > 0 else ""
+        t0 = time.monotonic()
+        logger.info(
+            "[%d/%d] START  %s (%s)%s", idx + 1, total, full_task_id, project, retry_tag
+        )
+
+        try:
+            async with session.post(
+                f"{server}/task/solve",
+                json=payload,
+                timeout=None,
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    elapsed = time.monotonic() - t0
+                    logger.error(
+                        "[%d/%d] HTTP %d  %s (%.1fs): %s",
+                        idx + 1,
+                        total,
+                        resp.status,
+                        full_task_id,
+                        elapsed,
+                        error_text[:200],
+                    )
+                    last_result = {
+                        "task_id": full_task_id,
+                        "request_id": request_id,
+                        "status": "error",
+                        "error": f"HTTP {resp.status}: {error_text[:500]}",
+                        "error_source": "benchmark_server",
+                        "elapsed": round(elapsed, 1),
+                    }
+                    if _is_retryable_error(last_result) and attempt < max_retries:
+                        delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                        logger.warning(
+                            "[%d/%d] RETRY  %s in %ds (attempt %d/%d)",
+                            idx + 1,
+                            total,
+                            full_task_id,
+                            delay,
+                            attempt + 1,
+                            max_retries,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    last_result["retries"] = attempt
+                    return last_result
+
+                data = await resp.json()
                 elapsed = time.monotonic() - t0
-                logger.error(
-                    "[%d/%d] HTTP %d  %s (%.1fs): %s",
+
+                status = data.get("status", "unknown")
+                result = data.get("result", {})
+                poc_found = result.get("poc_found", False)
+                poc_size = result.get("poc_size", 0)
+                steps = data.get("metrics", {}).get("step_count", 0)
+
+                icon = "✓" if poc_found else "✗"
+                logger.info(
+                    "[%d/%d] %s DONE  %s — %s, poc=%s(%dB), steps=%d, %.1fs",
                     idx + 1,
                     total,
-                    resp.status,
+                    icon,
                     full_task_id,
+                    status,
+                    poc_found,
+                    poc_size,
+                    steps,
                     elapsed,
-                    error_text[:200],
                 )
+
                 return {
                     "task_id": full_task_id,
                     "request_id": request_id,
-                    "status": "error",
-                    "error": f"HTTP {resp.status}: {error_text[:500]}",
-                    "error_source": "benchmark_server",
+                    "status": status,
+                    "poc_found": poc_found,
+                    "poc_size": poc_size,
+                    "poc_base64": result.get("poc_base64", ""),
+                    "project_name": result.get("project_name", ""),
+                    "workspace": data.get("workspace", ""),
+                    "session_id": data.get("session_id", ""),
+                    "session_data": data.get("session_data"),
+                    "metrics": data.get("metrics", {}),
                     "elapsed": round(elapsed, 1),
+                    "error": data.get("error", ""),
+                    "had_memory": bool(memory_context),
+                    "retries": attempt,
                 }
 
-            data = await resp.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
             elapsed = time.monotonic() - t0
-
-            status = data.get("status", "unknown")
-            result = data.get("result", {})
-            poc_found = result.get("poc_found", False)
-            poc_size = result.get("poc_size", 0)
-            steps = data.get("metrics", {}).get("step_count", 0)
-
-            icon = "✓" if poc_found else "✗"
-            logger.info(
-                "[%d/%d] %s DONE  %s — %s, poc=%s(%dB), steps=%d, %.1fs",
+            err_str = str(e)
+            if "ConnectionReset" in err_str or "ConnectionRefused" in err_str:
+                error_source = "benchmark_server"
+            elif "ContentLengthError" in err_str or "payload" in err_str.lower():
+                error_source = "benchmark_server"
+            elif "TimeoutError" in type(e).__name__:
+                error_source = "network"
+            elif "DNS" in err_str or "getaddrinfo" in err_str:
+                error_source = "network"
+            else:
+                error_source = "benchmark_server"
+            logger.error(
+                "[%d/%d] EXCEPTION %s — [%s] %s (%.1fs)",
                 idx + 1,
                 total,
-                icon,
                 full_task_id,
-                status,
-                poc_found,
-                poc_size,
-                steps,
+                error_source,
+                e,
                 elapsed,
             )
-
-            return {
+            last_result = {
                 "task_id": full_task_id,
                 "request_id": request_id,
-                "status": status,
-                "poc_found": poc_found,
-                "poc_size": poc_size,
-                "poc_base64": result.get("poc_base64", ""),
-                "project_name": result.get("project_name", ""),
-                "workspace": data.get("workspace", ""),
-                "session_id": data.get("session_id", ""),
-                "session_data": data.get("session_data"),
-                "metrics": data.get("metrics", {}),
+                "status": "error",
+                "error": str(e),
+                "error_source": error_source,
                 "elapsed": round(elapsed, 1),
-                "error": data.get("error", ""),
-                "had_memory": bool(memory_context),
             }
+            if _is_retryable_error(last_result) and attempt < max_retries:
+                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                logger.warning(
+                    "[%d/%d] RETRY  %s in %ds (attempt %d/%d)",
+                    idx + 1,
+                    total,
+                    full_task_id,
+                    delay,
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(delay)
+                continue
+            last_result["retries"] = attempt
+            return last_result
 
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        elapsed = time.monotonic() - t0
-        # Classify error source from exception type
-        err_str = str(e)
-        if "ConnectionReset" in err_str or "ConnectionRefused" in err_str:
-            error_source = "benchmark_server"
-        elif "ContentLengthError" in err_str or "payload" in err_str.lower():
-            error_source = "benchmark_server"
-        elif "TimeoutError" in type(e).__name__:
-            error_source = "network"
-        elif "DNS" in err_str or "getaddrinfo" in err_str:
-            error_source = "network"
-        else:
-            error_source = "benchmark_server"
-        logger.error(
-            "[%d/%d] EXCEPTION %s — [%s] %s (%.1fs)",
-            idx + 1,
-            total,
-            full_task_id,
-            error_source,
-            e,
-            elapsed,
-        )
-        return {
-            "task_id": full_task_id,
-            "request_id": request_id,
-            "status": "error",
-            "error": str(e),
-            "error_source": error_source,
-            "elapsed": round(elapsed, 1),
-        }
+    assert last_result is not None
+    last_result["retries"] = max_retries
+    return last_result
 
 
 # ── Batch runner ────────────────────────────────────────────────────────────
@@ -881,8 +956,11 @@ async def run_batch(
                 )
                 memory_context, retrieved_ids = memrl.retrieve(query)
 
-            # Client-side timeout: give server timeout + 120s grace for network/startup
-            client_timeout = timeout + 120
+            # Client-side timeout: account for retries.
+            # Each attempt can take up to (timeout + 120s), plus retry delays.
+            max_retries = DEFAULT_MAX_RETRIES
+            retry_overhead = sum(RETRY_DELAYS[:max_retries]) + 60  # delays + buffer
+            client_timeout = timeout + 120 + retry_overhead
             t_start = time.monotonic()
             try:
                 result = await asyncio.wait_for(
@@ -898,6 +976,7 @@ async def run_batch(
                         idx,
                         total,
                         memory_context,
+                        max_retries=max_retries,
                     ),
                     timeout=client_timeout,
                 )
@@ -1057,7 +1136,8 @@ async def run_batch(
     )
 
     connector = aiohttp.TCPConnector(limit=concurrency + 2)
-    client_timeout = aiohttp.ClientTimeout(total=timeout + 120)
+    retry_overhead = sum(RETRY_DELAYS[:DEFAULT_MAX_RETRIES]) + 60
+    client_timeout = aiohttp.ClientTimeout(total=timeout + 120 + retry_overhead)
 
     # Periodic progress reporter
     _progress_count = {"done": 0, "ok": 0, "err": 0, "t0": time.monotonic()}
@@ -1108,6 +1188,8 @@ def print_summary(results: list[dict[str, Any]], elapsed: float) -> dict[str, An
     n_timeout = sum(1 for r in results if r.get("status") == "timeout")
     n_error = sum(1 for r in results if r.get("status") == "error")
     n_poc_found = sum(1 for r in results if r.get("poc_found"))
+    n_retried = sum(1 for r in results if r.get("retries", 0) > 0)
+    total_retries = sum(r.get("retries", 0) for r in results)
     n_session_saved = sum(1 for r in results if r.get("session_data_saved"))
     n_with_memory = sum(1 for r in results if r.get("had_memory"))
     n_validated = sum(1 for r in results if r.get("validation_passed") is not None)
@@ -1169,6 +1251,10 @@ def print_summary(results: list[dict[str, Any]], elapsed: float) -> dict[str, An
     if n_validation_errors:
         print(f"  Val errors:  {n_validation_errors} (validation_server)")
     print(f"  PoC Found:   {n_poc_found}/{n_total} ({summary['poc_rate']}%)")
+    if n_retried:
+        print(
+            f"  Retries:     {n_retried} tasks retried ({total_retries} total attempts)"
+        )
     if n_validated:
         print(
             f"  Validated:   {n_passed}/{n_validated} passed "
