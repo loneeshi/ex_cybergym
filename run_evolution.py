@@ -639,7 +639,7 @@ def run_evolution(
                 )
                 return mem_id, real_success
 
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
                 futures = {executor.submit(_build_one, r): r for r in results}
                 for future in as_completed(futures):
                     try:

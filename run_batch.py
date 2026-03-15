@@ -954,7 +954,10 @@ async def run_batch(
                     f"{instance.get('vulnerability_description', '')} "
                     f"{instance.get('crash_type', '')}"
                 )
-                memory_context, retrieved_ids = memrl.retrieve(query)
+                memory_context, retrieved_ids = await asyncio.to_thread(
+                    memrl.retrieve,
+                    query,
+                )
 
             # Client-side timeout: account for retries.
             # Each attempt can take up to (timeout + 120s), plus retry delays.
@@ -1059,7 +1062,8 @@ async def run_batch(
             if memrl:
                 # ── Update Q-values for retrieved memories (RL feedback) ──
                 if retrieved_ids:
-                    memrl.update_values(
+                    await asyncio.to_thread(
+                        memrl.update_values,
                         [1.0 if real_success else 0.0],
                         [retrieved_ids],
                     )
@@ -1100,7 +1104,8 @@ async def run_batch(
                     )
                     trajectory_summary += "\n".join(fallback_parts) + "\n"
 
-                new_mem_id = memrl.build(
+                new_mem_id = await asyncio.to_thread(
+                    memrl.build,
                     task_description=(instance.get("vulnerability_description", "")),
                     trajectory=trajectory_summary,
                     metadata={
@@ -1117,7 +1122,8 @@ async def run_batch(
                 # Inline Q-value self-update: immediately apply Q-learning
                 # with the known task outcome (Round 2+ per-task update).
                 if new_mem_id:
-                    memrl.update_values(
+                    await asyncio.to_thread(
+                        memrl.update_values,
                         [1.0 if real_success else 0.0],
                         [[new_mem_id]],
                     )

@@ -76,6 +76,13 @@ def main():
         help="Save MEMRL checkpoint after building (default: <results_dir>/memrl_checkpoint)",
     )
     p.add_argument(
+        "-c",
+        "--concurrency",
+        type=int,
+        default=8,
+        help="Concurrent memory build threads (default: 8)",
+    )
+    p.add_argument(
         "--test-queries",
         type=int,
         default=5,
@@ -188,7 +195,7 @@ def main():
             "build_time": round(build_time, 2),
         }
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {executor.submit(_build_one, i, r): r for i, r in enumerate(results)}
         for future in as_completed(futures):
             try:
