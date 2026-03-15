@@ -611,7 +611,13 @@ def validate_poc_inline(
 ) -> dict[str, Any]:
     """Validate a single PoC against the CyberGym dual-container server.
 
-    Returns {"passed": bool, "vul_exit_code": int|None, "fix_exit_code": int|None}.
+    Returns a dict with:
+      - ``passed``: True if vul container crashed AND fix container didn't
+      - ``vul_exit_code`` / ``fix_exit_code``: exit codes (None if unavailable)
+      - ``error``: error message if validation couldn't complete
+      - ``server_error``: True if the failure was due to the validation server
+        itself (e.g., missing Docker image), not the PoC being wrong.
+        When True, the result should NOT be used as a negative MEMRL signal.
     """
     import httpx
 
@@ -642,6 +648,17 @@ def validate_poc_inline(
                 files={"file": ("poc", poc_bytes, "application/octet-stream")},
                 headers=headers,
             )
+            if vul_resp.status_code >= 500:
+                error_detail = ""
+                try:
+                    error_detail = vul_resp.json().get("detail", "")
+                except Exception:
+                    error_detail = vul_resp.text[:500]
+                result["error"] = (
+                    f"submit-vul server error {vul_resp.status_code}: {error_detail}"
+                )
+                result["server_error"] = True
+                return result
             vul_resp.raise_for_status()
             vul_data = vul_resp.json()
             result["vul_exit_code"] = vul_data.get("exit_code")
@@ -652,6 +669,17 @@ def validate_poc_inline(
                 files={"file": ("poc", poc_bytes, "application/octet-stream")},
                 headers=headers,
             )
+            if fix_resp.status_code >= 500:
+                error_detail = ""
+                try:
+                    error_detail = fix_resp.json().get("detail", "")
+                except Exception:
+                    error_detail = fix_resp.text[:500]
+                result["error"] = (
+                    f"submit-fix server error {fix_resp.status_code}: {error_detail}"
+                )
+                result["server_error"] = True
+                return result
             fix_resp.raise_for_status()
             fix_data = fix_resp.json()
             result["fix_exit_code"] = fix_data.get("exit_code")
@@ -665,6 +693,9 @@ def validate_poc_inline(
             result["passed"] = vul_crashed and fix_ok
     except Exception as e:
         result["error"] = str(e)
+        error_str = str(e).lower()
+        if "500" in error_str or "502" in error_str or "503" in error_str:
+            result["server_error"] = True
 
     return result
 
@@ -1079,22 +1110,37 @@ async def run_batch(
                         poc_b64,
                     )
                     validated = True
-                    real_success = validation_result.get("passed", False)
                     result["validation"] = validation_result
-                    result["validation_passed"] = real_success
                     result["vul_exit_code"] = validation_result.get("vul_exit_code")
                     result["fix_exit_code"] = validation_result.get("fix_exit_code")
-                    v_icon = "✓" if real_success else "✗"
-                    logger.info(
-                        "[%d/%d] VALIDATE %s %s — vul_exit=%s, fix_exit=%s, passed=%s",
-                        idx + 1,
-                        total,
-                        v_icon,
-                        result.get("task_id", task_id),
-                        validation_result.get("vul_exit_code"),
-                        validation_result.get("fix_exit_code"),
-                        real_success,
-                    )
+
+                    if validation_result.get("server_error"):
+                        real_success = poc_found
+                        result["validation_passed"] = None
+                        result["validation_server_error"] = True
+                        logger.warning(
+                            "[%d/%d] VALIDATE ⚠ %s — server error: %s "
+                            "(falling back to poc_found=%s for MEMRL)",
+                            idx + 1,
+                            total,
+                            result.get("task_id", task_id),
+                            validation_result.get("error", "unknown"),
+                            poc_found,
+                        )
+                    else:
+                        real_success = validation_result.get("passed", False)
+                        result["validation_passed"] = real_success
+                        v_icon = "✓" if real_success else "✗"
+                        logger.info(
+                            "[%d/%d] VALIDATE %s %s — vul_exit=%s, fix_exit=%s, passed=%s",
+                            idx + 1,
+                            total,
+                            v_icon,
+                            result.get("task_id", task_id),
+                            validation_result.get("vul_exit_code"),
+                            validation_result.get("fix_exit_code"),
+                            real_success,
+                        )
                 elif poc_found:
                     real_success = True
             except Exception as e:
@@ -1288,6 +1334,7 @@ def print_summary(results: list[dict[str, Any]], elapsed: float) -> dict[str, An
     n_with_memory = sum(1 for r in results if r.get("had_memory"))
     n_validated = sum(1 for r in results if r.get("validation_passed") is not None)
     n_passed = sum(1 for r in results if r.get("validation_passed"))
+    n_val_server_error = sum(1 for r in results if r.get("validation_server_error"))
     total_steps = sum(r.get("metrics", {}).get("step_count", 0) for r in results)
     total_tokens_in = sum(
         r.get("metrics", {}).get("tokens", {}).get("input", 0) for r in results
@@ -1315,6 +1362,7 @@ def print_summary(results: list[dict[str, Any]], elapsed: float) -> dict[str, An
         "poc_rate": round(n_poc_found / max(n_total, 1) * 100, 2),
         "validated": n_validated,
         "validation_passed": n_passed,
+        "validation_server_errors": n_val_server_error,
         "validation_pass_rate": round(n_passed / max(n_validated, 1) * 100, 2)
         if n_validated
         else 0,
@@ -1354,6 +1402,11 @@ def print_summary(results: list[dict[str, Any]], elapsed: float) -> dict[str, An
             f"  Validated:   {n_passed}/{n_validated} passed "
             f"({summary['validation_pass_rate']}%)"
         )
+        if n_val_server_error:
+            print(
+                f"  Val SrvErr:  {n_val_server_error} tasks had validation server errors "
+                f"(excluded from pass/fail)"
+            )
         failed_validations = [
             r
             for r in results

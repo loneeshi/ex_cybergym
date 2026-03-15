@@ -79,8 +79,15 @@ from run_batch import (
 
 def _load_completed_round1_tasks(
     round_dir: Path,
+    valid_task_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], set[str]]:
     """Scan round_dir/tasks/ for completed task results from a previous run.
+
+    Args:
+        round_dir: Directory containing tasks/ subdirectory with result JSONs.
+        valid_task_ids: If provided, only load results for tasks in this set.
+            This prevents stale results from a previous larger run from leaking
+            in when the output directory is reused with fewer tasks.
 
     Returns:
         (completed_results, completed_task_ids)
@@ -98,10 +105,11 @@ def _load_completed_round1_tasks(
         try:
             r = json.loads(f.read_text())
             if r.get("status") == "completed":
-                completed.append(r)
                 tid = r.get("task_id", "")
-                # task_id has "/level1" suffix, strip for matching
                 base_tid = tid.split("/")[0] if "/" in tid else tid
+                if valid_task_ids is not None and base_tid not in valid_task_ids:
+                    continue
+                completed.append(r)
                 completed_ids.add(base_tid)
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("Failed to read task file %s: %s", f, e)
@@ -487,7 +495,9 @@ def run_evolution(
         round_t0 = time.monotonic()
         if round_num == 1:
             # ── Round 1 intra-round resume: skip already-completed tasks ──
-            prev_completed, prev_completed_ids = _load_completed_round1_tasks(round_dir)
+            prev_completed, prev_completed_ids = _load_completed_round1_tasks(
+                round_dir, valid_task_ids=set(task_ids)
+            )
             remaining_task_ids = [
                 tid for tid in task_ids if tid not in prev_completed_ids
             ]
