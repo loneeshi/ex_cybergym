@@ -421,67 +421,43 @@ def run_evolution(
 
     total_t0 = time.monotonic()
 
-    for round_num in range(resume_from, num_rounds + 1):
-        round_dir = base_output_dir / f"round_{round_num:03d}"
-        round_dir.mkdir(parents=True, exist_ok=True)
-
-        # Determine checkpoint path: previous round's checkpoint
+    # Initialize MEMRL once and reuse across all rounds.
+    # Memories built inline during each round persist in memory;
+    # checkpoints are saved for crash recovery only, not reloaded.
+    memrl_helper: Optional[MemRLHelper] = None
+    if resume_from > 1:
+        # Resuming: find the latest valid checkpoint to seed the helper
         checkpoint_path: str | None = None
-        if round_num > 1:
-            prev_ckpt = (
-                base_output_dir / f"round_{round_num - 1:03d}" / "memrl_checkpoint"
-            )
-            # Check that checkpoint is actually valid (has cube/ subdirectory)
-            # save_checkpoint_snapshot creates: checkpoint/snapshot/<ckpt_id>/cube/
+        for prev_r in range(resume_from - 1, 0, -1):
+            prev_ckpt = base_output_dir / f"round_{prev_r:03d}" / "memrl_checkpoint"
             cube_check = prev_ckpt / "snapshot" / "cybergym" / "cube"
             if prev_ckpt.exists() and cube_check.exists():
                 checkpoint_path = str(prev_ckpt)
-            elif prev_ckpt.exists():
-                logger.warning(
-                    "Round %d checkpoint at %s is incomplete (no cube/ at %s) — "
-                    "searching for last valid checkpoint",
-                    round_num - 1,
-                    prev_ckpt,
-                    cube_check,
+                logger.info(
+                    "Found valid checkpoint from round %d: %s", prev_r, prev_ckpt
                 )
-                # Search backwards for the last valid checkpoint
-                for prev_r in range(round_num - 2, 0, -1):
-                    fallback = (
-                        base_output_dir / f"round_{prev_r:03d}" / "memrl_checkpoint"
-                    )
-                    fallback_cube = fallback / "snapshot" / "cybergym" / "cube"
-                    if fallback.exists() and fallback_cube.exists():
-                        checkpoint_path = str(fallback)
-                        logger.info(
-                            "Found valid checkpoint from round %d: %s", prev_r, fallback
-                        )
-                        break
-                if not checkpoint_path:
-                    logger.warning(
-                        "No valid checkpoint found — starting without memory"
-                    )
-            else:
-                logger.warning(
-                    "Round %d checkpoint not found at %s — starting without memory",
-                    round_num - 1,
-                    prev_ckpt,
-                )
-
-        print_round_header(round_num, num_rounds, checkpoint_path)
-
-        # Initialize MEMRL for this round
-        memrl_helper: Optional[MemRLHelper] = None
+                break
         try:
             memrl_helper = MemRLHelper(
                 config_path=memrl_config,
                 checkpoint_path=checkpoint_path,
             )
         except Exception as e:
-            logger.error("MEMRL init failed for round %d: %s", round_num, e)
-            logger.warning(
-                "Round %d continuing WITHOUT memory (results still collected)",
-                round_num,
-            )
+            logger.error("MEMRL init failed: %s", e)
+            logger.warning("Continuing WITHOUT memory")
+    else:
+        # Fresh start: no checkpoint to load
+        try:
+            memrl_helper = MemRLHelper(config_path=memrl_config)
+        except Exception as e:
+            logger.error("MEMRL init failed: %s", e)
+            logger.warning("Continuing WITHOUT memory")
+
+    for round_num in range(resume_from, num_rounds + 1):
+        round_dir = base_output_dir / f"round_{round_num:03d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+
+        print_round_header(round_num, num_rounds, None)
 
         # Save round config
         (round_dir / "config.json").write_text(
@@ -496,7 +472,7 @@ def run_evolution(
                     "step_limit": step_limit,
                     "num_tasks": total_tasks,
                     "memrl_enabled": True,
-                    "memrl_checkpoint": checkpoint_path,
+                    "memrl_reused": round_num > 1,
                     "include_task_prompt": False,
                     "system_prompt": SYSTEM_PROMPT,
                     "timestamp": datetime.now().isoformat(),
@@ -506,9 +482,8 @@ def run_evolution(
         )
 
         # Run the batch
-        # All rounds: inline validation via cybergym_server (concurrent)
-        # Round 1: no memrl (no memory to retrieve yet)
-        # Round 2+: memrl enabled for memory retrieval + building
+        # Round 1: memrl build_only (build memories inline, no retrieval)
+        # Round 2+: full memrl (retrieve + build)
         round_t0 = time.monotonic()
         if round_num == 1:
             # ── Round 1 intra-round resume: skip already-completed tasks ──
@@ -623,9 +598,6 @@ def run_evolution(
 
         # Save intermediate evolution state (for crash recovery)
         _save_evolution_state(base_output_dir, round_summaries, poc_bank, total_tasks)
-
-        # Cleanup: release MEMRL resources
-        del memrl_helper
 
     total_elapsed = time.monotonic() - total_t0
 
