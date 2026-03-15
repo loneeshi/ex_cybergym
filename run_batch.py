@@ -1176,20 +1176,40 @@ async def run_batch(
             )
 
     async def _maybe_checkpoint(done: int):
-        """Save MEMRL checkpoint periodically to avoid losing memories on crash."""
+        """Save MEMRL checkpoint periodically to avoid losing memories on crash.
+
+        Writes to a temp directory first, then atomically replaces the real
+        checkpoint dir so a crash mid-write won't corrupt the previous good copy.
+        """
         if not memrl or checkpoint_interval <= 0:
             return
         if done % checkpoint_interval != 0:
             return
         async with _checkpoint_lock:
-            ckpt_dir = str(output_dir / "memrl_checkpoint")
+            import shutil
+
+            ckpt_dir = output_dir / "memrl_checkpoint"
+            ckpt_tmp = output_dir / "memrl_checkpoint_tmp"
+            ckpt_prev = output_dir / "memrl_checkpoint_prev"
             logger.info(
                 "Periodic MEMRL checkpoint at %d/%d tasks → %s",
                 done,
                 total,
                 ckpt_dir,
             )
-            await asyncio.to_thread(memrl.save_checkpoint, ckpt_dir)
+            try:
+                if ckpt_tmp.exists():
+                    shutil.rmtree(ckpt_tmp)
+                await asyncio.to_thread(memrl.save_checkpoint, str(ckpt_tmp))
+                if ckpt_prev.exists():
+                    shutil.rmtree(ckpt_prev)
+                if ckpt_dir.exists():
+                    ckpt_dir.rename(ckpt_prev)
+                ckpt_tmp.rename(ckpt_dir)
+                if ckpt_prev.exists():
+                    shutil.rmtree(ckpt_prev)
+            except Exception as e:
+                logger.warning("Periodic checkpoint failed: %s", e)
 
     async def _tracked_solve(tid, idx):
         result = await bounded_solve(tid, idx)
