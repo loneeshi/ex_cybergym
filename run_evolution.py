@@ -164,9 +164,17 @@ def _replay_memrl_for_completed_tasks(
     the process.  This rebuilds those memories so the round-end checkpoint is
     complete.
 
-    Uses ThreadPoolExecutor for concurrent replay — the bottleneck is network
-    calls to the embedding API, so parallelism gives a large speedup (e.g.
-    1382 tasks: ~30min serial → ~2min with 16 workers).
+    Architecture: producer-consumer pipeline.
+      Phase 1 (parallel): Read session files and build trajectory strings using
+        a thread pool — I/O bound on disk reads, no MEMRL state involved.
+      Phase 2 (serial): Feed prepared payloads into memrl.build() one at a time.
+        MEMRL's underlying SQLite + Qdrant are NOT thread-safe for concurrent
+        writes, so serialising avoids "cannot commit - no transaction is active"
+        errors that corrupt the connection.
+
+    This is still much faster than fully serial replay because phase 1 overlaps
+    with phase 2 via a queue, and the LLM/embedding calls inside build_memory()
+    dominate wall time (not the data prep).
 
     NOTE: Q-value updates for *retrieved* memories from the original run cannot
     be replayed (retrieved IDs are not persisted).  Only the newly built memory's
@@ -181,7 +189,9 @@ def _replay_memrl_for_completed_tasks(
     if not completed_results:
         return 0
 
-    def _replay_one(r: dict[str, Any]) -> int:
+    # ── Phase 1: parallel data preparation ──────────────────────────────
+    def _prepare_one(r: dict[str, Any]) -> dict[str, Any] | None:
+        """Read session file and build trajectory string (no MEMRL calls)."""
         task_id = r.get("task_id", "")
         base_tid = task_id.split("/")[0] if "/" in task_id else task_id
         instance = instances.get(base_tid, {})
@@ -209,10 +219,11 @@ def _replay_memrl_for_completed_tasks(
                 f"\n## Agent Problem-Solving Trajectory\n{session_trajectory}\n"
             )
 
-        mem_id = memrl.build(
-            task_description=instance.get("vulnerability_description", ""),
-            trajectory=trajectory_summary,
-            metadata={
+        return {
+            "task_id": task_id,
+            "task_description": instance.get("vulnerability_description", ""),
+            "trajectory": trajectory_summary,
+            "metadata": {
                 "source": "cybergym",
                 "task_id": task_id,
                 "project": instance.get("project_name", ""),
@@ -221,44 +232,66 @@ def _replay_memrl_for_completed_tasks(
                 "level": task_id.split("/")[-1] if "/" in task_id else "level1",
                 "replayed": True,
             },
-        )
-        if mem_id:
-            memrl.update_values(
-                [1.0 if real_success else 0.0],
-                [[mem_id]],
-            )
-            return 1
-        return 0
+            "real_success": real_success,
+        }
 
     n_total = len(completed_results)
-    n_built = 0
-    n_done = 0
-
     logger.info(
-        "MEMRL replay: %d tasks with %d workers...",
+        "MEMRL replay: preparing %d tasks with %d workers...",
         n_total,
         max_workers,
     )
+
+    payloads: list[dict[str, Any]] = []
+    prep_t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_replay_one, r): r for r in completed_results}
+        futures = {pool.submit(_prepare_one, r): r for r in completed_results}
         for future in as_completed(futures):
             try:
-                n_built += future.result()
+                payload = future.result()
+                if payload:
+                    payloads.append(payload)
             except Exception as e:
                 r = futures[future]
                 logger.warning(
-                    "MEMRL replay failed for %s: %s",
+                    "MEMRL prep failed for %s: %s",
                     r.get("task_id", "?"),
                     e,
                 )
-            n_done += 1
-            if n_done % 100 == 0 or n_done == n_total:
-                logger.info(
-                    "MEMRL replay progress: %d/%d (built: %d)",
-                    n_done,
-                    n_total,
-                    n_built,
+    logger.info(
+        "MEMRL replay: data prep done in %.1fs (%d payloads ready)",
+        time.monotonic() - prep_t0,
+        len(payloads),
+    )
+
+    # ── Phase 2: serial MEMRL build (SQLite is not thread-safe) ─────────
+    n_built = 0
+    for i, p in enumerate(payloads, 1):
+        try:
+            mem_id = memrl.build(
+                task_description=p["task_description"],
+                trajectory=p["trajectory"],
+                metadata=p["metadata"],
+            )
+            if mem_id:
+                memrl.update_values(
+                    [1.0 if p["real_success"] else 0.0],
+                    [[mem_id]],
                 )
+                n_built += 1
+        except Exception as e:
+            logger.warning(
+                "MEMRL replay build failed for %s: %s",
+                p["task_id"],
+                e,
+            )
+        if i % 100 == 0 or i == len(payloads):
+            logger.info(
+                "MEMRL replay progress: %d/%d (built: %d)",
+                i,
+                len(payloads),
+                n_built,
+            )
 
     return n_built
 
