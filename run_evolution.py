@@ -122,6 +122,8 @@ def _replay_memrl_for_completed_tasks(
     sessions_dir: Path,
     instances: dict[str, dict[str, Any]],
     memrl: MemRLHelper,
+    *,
+    max_workers: int = 16,
 ) -> int:
     """Replay MEMRL build for previously completed tasks during intra-round resume.
 
@@ -129,6 +131,10 @@ def _replay_memrl_for_completed_tasks(
     crash already have results on disk, but their MEMRL memories were lost with
     the process.  This rebuilds those memories so the round-end checkpoint is
     complete.
+
+    Uses ThreadPoolExecutor for concurrent replay — the bottleneck is network
+    calls to the embedding API, so parallelism gives a large speedup (e.g.
+    1382 tasks: ~30min serial → ~2min with 16 workers).
 
     NOTE: Q-value updates for *retrieved* memories from the original run cannot
     be replayed (retrieved IDs are not persisted).  Only the newly built memory's
@@ -138,8 +144,12 @@ def _replay_memrl_for_completed_tasks(
     Returns:
         Number of memories successfully built.
     """
-    n_built = 0
-    for r in completed_results:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not completed_results:
+        return 0
+
+    def _replay_one(r: dict[str, Any]) -> int:
         task_id = r.get("task_id", "")
         base_tid = task_id.split("/")[0] if "/" in task_id else task_id
         instance = instances.get(base_tid, {})
@@ -185,7 +195,38 @@ def _replay_memrl_for_completed_tasks(
                 [1.0 if real_success else 0.0],
                 [[mem_id]],
             )
-            n_built += 1
+            return 1
+        return 0
+
+    n_total = len(completed_results)
+    n_built = 0
+    n_done = 0
+
+    logger.info(
+        "MEMRL replay: %d tasks with %d workers...",
+        n_total,
+        max_workers,
+    )
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_replay_one, r): r for r in completed_results}
+        for future in as_completed(futures):
+            try:
+                n_built += future.result()
+            except Exception as e:
+                r = futures[future]
+                logger.warning(
+                    "MEMRL replay failed for %s: %s",
+                    r.get("task_id", "?"),
+                    e,
+                )
+            n_done += 1
+            if n_done % 100 == 0 or n_done == n_total:
+                logger.info(
+                    "MEMRL replay progress: %d/%d (built: %d)",
+                    n_done,
+                    n_total,
+                    n_built,
+                )
 
     return n_built
 
@@ -534,33 +575,26 @@ def run_evolution(
     # Memories built inline during each round persist in memory;
     # checkpoints are saved for crash recovery only, not reloaded.
     memrl_helper: Optional[MemRLHelper] = None
-    if resume_from > 1:
-        # Resuming: find the latest valid checkpoint to seed the helper
-        checkpoint_path: str | None = None
-        for prev_r in range(resume_from - 1, 0, -1):
-            prev_ckpt = base_output_dir / f"round_{prev_r:03d}" / "memrl_checkpoint"
-            cube_check = prev_ckpt / "snapshot" / "cybergym" / "cube"
-            if prev_ckpt.exists() and cube_check.exists():
-                checkpoint_path = str(prev_ckpt)
-                logger.info(
-                    "Found valid checkpoint from round %d: %s", prev_r, prev_ckpt
-                )
-                break
-        try:
-            memrl_helper = MemRLHelper(
-                config_path=memrl_config,
-                checkpoint_path=checkpoint_path,
-            )
-        except Exception as e:
-            logger.error("MEMRL init failed: %s", e)
-            logger.warning("Continuing WITHOUT memory")
-    else:
-        # Fresh start: no checkpoint to load
-        try:
-            memrl_helper = MemRLHelper(config_path=memrl_config)
-        except Exception as e:
-            logger.error("MEMRL init failed: %s", e)
-            logger.warning("Continuing WITHOUT memory")
+    # Find the latest valid checkpoint — even for resume_from == 1, a
+    # previous partial run may have saved a checkpoint that we can load
+    # instead of replaying all completed tasks from scratch.
+    checkpoint_path: str | None = None
+    search_up_to = resume_from if resume_from > 1 else 2  # check round_001 too
+    for prev_r in range(search_up_to - 1, 0, -1):
+        prev_ckpt = base_output_dir / f"round_{prev_r:03d}" / "memrl_checkpoint"
+        cube_check = prev_ckpt / "snapshot" / "cybergym" / "cube"
+        if prev_ckpt.exists() and cube_check.exists():
+            checkpoint_path = str(prev_ckpt)
+            logger.info("Found valid checkpoint from round %d: %s", prev_r, prev_ckpt)
+            break
+    try:
+        memrl_helper = MemRLHelper(
+            config_path=memrl_config,
+            checkpoint_path=checkpoint_path,
+        )
+    except Exception as e:
+        logger.error("MEMRL init failed: %s", e)
+        logger.warning("Continuing WITHOUT memory")
 
     for round_num in range(resume_from, num_rounds + 1):
         round_dir = base_output_dir / f"round_{round_num:03d}"
