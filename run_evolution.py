@@ -100,19 +100,51 @@ def _load_completed_round_tasks(
 
     completed: list[dict[str, Any]] = []
     completed_ids: set[str] = set()
+    status_counts: dict[str, int] = {}
+    n_skipped_invalid = 0
 
     for f in tasks_dir.glob("*.json"):
         try:
             r = json.loads(f.read_text())
-            if r.get("status") == "completed":
+            status = r.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if status == "completed":
                 tid = r.get("task_id", "")
                 base_tid = tid.split("/")[0] if "/" in tid else tid
                 if valid_task_ids is not None and base_tid not in valid_task_ids:
+                    n_skipped_invalid += 1
                     continue
                 completed.append(r)
                 completed_ids.add(base_tid)
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("Failed to read task file %s: %s", f, e)
+
+    total_files = sum(status_counts.values())
+    status_str = ", ".join(f"{s}={c}" for s, c in sorted(status_counts.items()))
+    logger.info(
+        "Loaded %d task files from %s: %s",
+        total_files,
+        tasks_dir.name,
+        status_str,
+    )
+    if n_skipped_invalid:
+        logger.info(
+            "  Skipped %d tasks not in current valid_task_ids", n_skipped_invalid
+        )
+
+    # Count PoC stats for completed tasks
+    n_poc = sum(1 for r in completed if r.get("poc_found"))
+    n_validated = sum(1 for r in completed if r.get("validation_passed") is not None)
+    n_val_passed = sum(1 for r in completed if r.get("validation_passed"))
+    n_val_srv_err = sum(1 for r in completed if r.get("validation_server_error"))
+    logger.info(
+        "  Completed: %d (poc_found=%d, validated=%d, val_passed=%d, val_srv_err=%d)",
+        len(completed),
+        n_poc,
+        n_validated,
+        n_val_passed,
+        n_val_srv_err,
+    )
 
     return completed, completed_ids
 
@@ -587,10 +619,18 @@ def run_evolution(
             checkpoint_path = str(prev_ckpt)
             logger.info("Found valid checkpoint from round %d: %s", prev_r, prev_ckpt)
             break
+    if not checkpoint_path:
+        logger.info("No existing checkpoint found — MEMRL starts fresh")
+    memrl_init_t0 = time.monotonic()
     try:
         memrl_helper = MemRLHelper(
             config_path=memrl_config,
             checkpoint_path=checkpoint_path,
+        )
+        logger.info(
+            "MEMRL initialized in %.1fs (checkpoint=%s)",
+            time.monotonic() - memrl_init_t0,
+            "loaded" if checkpoint_path else "none",
         )
     except Exception as e:
         logger.error("MEMRL init failed: %s", e)
@@ -647,6 +687,7 @@ def run_evolution(
                 # Replay MEMRL build for completed tasks so round-end checkpoint
                 # includes all memories (not just those from newly run tasks).
                 if memrl_helper:
+                    replay_t0 = time.monotonic()
                     logger.info(
                         "Replaying MEMRL build for %d previously completed tasks...",
                         len(prev_completed),
@@ -657,10 +698,13 @@ def run_evolution(
                         instances,
                         memrl_helper,
                     )
+                    replay_elapsed = time.monotonic() - replay_t0
                     logger.info(
-                        "MEMRL replay: %d/%d memories rebuilt",
+                        "MEMRL replay done: %d/%d memories rebuilt in %.1fs (%.1f tasks/s)",
                         n_replayed,
                         len(prev_completed),
+                        replay_elapsed,
+                        len(prev_completed) / max(replay_elapsed, 0.1),
                     )
 
             if remaining_task_ids:
@@ -669,6 +713,7 @@ def run_evolution(
                     len(remaining_task_ids),
                     concurrency,
                 )
+                submit_t0 = time.monotonic()
                 new_results = asyncio.run(
                     run_single_round(
                         round_num=round_num,
@@ -685,6 +730,21 @@ def run_evolution(
                         cybergym_server=cybergym_server,
                         memrl_build_only=True,
                     )
+                )
+                submit_elapsed = time.monotonic() - submit_t0
+                n_new_ok = sum(1 for r in new_results if r.get("status") == "completed")
+                n_new_err = sum(1 for r in new_results if r.get("status") == "error")
+                n_new_tout = sum(1 for r in new_results if r.get("status") == "timeout")
+                n_new_poc = sum(1 for r in new_results if r.get("poc_found"))
+                logger.info(
+                    "Round 1 batch done: %d tasks in %.0fs — "
+                    "completed=%d, error=%d, timeout=%d, poc_found=%d",
+                    len(new_results),
+                    submit_elapsed,
+                    n_new_ok,
+                    n_new_err,
+                    n_new_tout,
+                    n_new_poc,
                 )
             else:
                 new_results = []
@@ -710,6 +770,7 @@ def run_evolution(
                 )
                 # Replay MEMRL build for completed tasks
                 if memrl_helper:
+                    replay_t0 = time.monotonic()
                     logger.info(
                         "Replaying MEMRL build for %d previously completed tasks...",
                         len(prev_completed),
@@ -720,13 +781,23 @@ def run_evolution(
                         instances,
                         memrl_helper,
                     )
+                    replay_elapsed = time.monotonic() - replay_t0
                     logger.info(
-                        "MEMRL replay: %d/%d memories rebuilt",
+                        "MEMRL replay done: %d/%d memories rebuilt in %.1fs (%.1f tasks/s)",
                         n_replayed,
                         len(prev_completed),
+                        replay_elapsed,
+                        len(prev_completed) / max(replay_elapsed, 0.1),
                     )
 
             if remaining_task_ids:
+                logger.info(
+                    "Round %d: submitting %d tasks to benchmark server (concurrency=%d)...",
+                    round_num,
+                    len(remaining_task_ids),
+                    concurrency,
+                )
+                submit_t0 = time.monotonic()
                 new_results = asyncio.run(
                     run_single_round(
                         round_num=round_num,
@@ -743,6 +814,22 @@ def run_evolution(
                         cybergym_server=cybergym_server,
                     )
                 )
+                submit_elapsed = time.monotonic() - submit_t0
+                n_new_ok = sum(1 for r in new_results if r.get("status") == "completed")
+                n_new_err = sum(1 for r in new_results if r.get("status") == "error")
+                n_new_tout = sum(1 for r in new_results if r.get("status") == "timeout")
+                n_new_poc = sum(1 for r in new_results if r.get("poc_found"))
+                logger.info(
+                    "Round %d batch done: %d tasks in %.0fs — "
+                    "completed=%d, error=%d, timeout=%d, poc_found=%d",
+                    round_num,
+                    len(new_results),
+                    submit_elapsed,
+                    n_new_ok,
+                    n_new_err,
+                    n_new_tout,
+                    n_new_poc,
+                )
             else:
                 new_results = []
                 logger.info(
@@ -758,8 +845,14 @@ def run_evolution(
 
         # Save MEMRL checkpoint for next round
         if memrl_helper:
+            ckpt_t0 = time.monotonic()
             ckpt_dir = str(round_dir / "memrl_checkpoint")
             memrl_helper.save_checkpoint(ckpt_dir)
+            logger.info(
+                "MEMRL checkpoint saved in %.1fs → %s",
+                time.monotonic() - ckpt_t0,
+                ckpt_dir,
+            )
 
         # Collect PoCs and update bank
         round_coverage = collect_poc_coverage(results)
@@ -786,18 +879,41 @@ def run_evolution(
         )
 
         # Log progress
+        n_srv_err = sum(1 for r in results if r.get("validation_server_error"))
+        n_err = sum(1 for r in results if r.get("status") == "error")
+        n_tout = sum(1 for r in results if r.get("status") == "timeout")
+        n_completed = sum(1 for r in results if r.get("status") == "completed")
         logger.info(
-            "Round %d/%d complete — PoC this round: %d/%d (%.1f%%), "
-            "new: %d, cumulative: %d/%d (%.1f%%)",
+            "Round %d/%d complete — %d tasks: completed=%d, error=%d, timeout=%d",
             round_num,
             num_rounds,
+            len(results),
+            n_completed,
+            n_err,
+            n_tout,
+        )
+        logger.info(
+            "  PoC this round: %d/%d (%.1f%%) | New unique: %d | Cumulative: %d/%d (%.1f%%)",
             summary["poc_found_this_round"],
-            total_tasks,
+            len(results),
             summary["poc_rate_this_round"],
             new_pocs,
             total_pocs,
             total_tasks,
             summary["cumulative_poc_rate"],
+        )
+        if summary.get("validated", 0) > 0:
+            logger.info(
+                "  Validation: %d tested, %d passed (%.1f%%), %d server errors",
+                summary["validated"],
+                summary["validation_passed"],
+                summary["validation_pass_rate"],
+                n_srv_err,
+            )
+        logger.info(
+            "  Wall time: %.0fs | Avg per task: %.1fs",
+            round_elapsed,
+            summary["avg_elapsed"],
         )
 
         # Save intermediate evolution state (for crash recovery)
