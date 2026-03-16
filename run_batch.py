@@ -444,6 +444,10 @@ class MemRLHelper:
                 logger.info(
                     "MEMRL loaded checkpoint: %s (%d memories)", resolved_ckpt, n
                 )
+                # Rebuild in-memory caches (dict_memory, query_embeddings) from
+                # checkpoint data so retrieve_query() works immediately without
+                # replaying build_memory() for every past task.
+                self._rebuild_caches_from_checkpoint(checkpoint_path)
             else:
                 logger.info("MEMRL initialized (no checkpoint)")
 
@@ -455,6 +459,86 @@ class MemRLHelper:
         except Exception as e:
             logger.error("Failed to initialize MEMRL: %s", e)
             raise
+
+    def _rebuild_caches_from_checkpoint(self, checkpoint_path: str) -> int:
+        """Rebuild dict_memory and query_embeddings from checkpoint data.
+
+        After load_checkpoint_snapshot restores Qdrant/SQLite, the in-memory
+        caches used by retrieve_query() are still empty.  This reads
+        textual_memory.json directly to populate them — zero API calls.
+
+        Returns:
+            Number of memories loaded into caches.
+        """
+        if not self.service or not hasattr(self.service, "dict_memory"):
+            return 0
+
+        tm_path = (
+            Path(checkpoint_path)
+            / "snapshot"
+            / "cybergym"
+            / "cube"
+            / "textual_memory.json"
+        )
+        if not tm_path.exists():
+            # Try searching recursively
+            for candidate in Path(checkpoint_path).rglob("textual_memory.json"):
+                tm_path = candidate
+                break
+            else:
+                logger.warning(
+                    "textual_memory.json not found in checkpoint — caches not rebuilt"
+                )
+                return 0
+
+        try:
+            import time as _time
+
+            t0 = _time.monotonic()
+            data = json.loads(tm_path.read_text())
+
+            # Handle both list format and dict-wrapped format
+            if isinstance(data, dict):
+                points = data.get(
+                    "points", data.get("data", list(data.values())[0] if data else [])
+                )
+            else:
+                points = data
+
+            dm = self.service.dict_memory
+            qe = getattr(self.service, "query_embeddings", None)
+            n_loaded = 0
+
+            for point in points:
+                payload = point.get("payload", {})
+                task_desc = payload.get("memory", "")
+                mem_id = payload.get("id", "")
+                vector = point.get("vector")
+
+                if not task_desc or not mem_id:
+                    continue
+
+                if task_desc in dm:
+                    dm[task_desc].append(mem_id)
+                else:
+                    dm[task_desc] = [mem_id]
+
+                if qe is not None and vector and task_desc not in qe:
+                    qe[task_desc] = vector
+
+                n_loaded += 1
+
+            elapsed = _time.monotonic() - t0
+            logger.info(
+                "Rebuilt caches from checkpoint in %.1fs: %d memories, %d unique tasks",
+                elapsed,
+                n_loaded,
+                len(dm),
+            )
+            return n_loaded
+        except Exception as e:
+            logger.warning("Failed to rebuild caches from checkpoint: %s", e)
+            return 0
 
     def retrieve(self, query: str) -> tuple[str, list[str]]:
         """Retrieve relevant memories and format as prompt context.

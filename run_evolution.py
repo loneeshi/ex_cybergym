@@ -687,26 +687,36 @@ def run_evolution(
                 )
                 # Replay MEMRL build for completed tasks so round-end checkpoint
                 # includes all memories (not just those from newly run tasks).
+                # SKIP if caches were already rebuilt from checkpoint data
+                # (dict_memory populated by _rebuild_caches_from_checkpoint).
                 if memrl_helper:
-                    replay_t0 = time.monotonic()
-                    logger.info(
-                        "Replaying MEMRL build for %d previously completed tasks...",
-                        len(prev_completed),
-                    )
-                    n_replayed = _replay_memrl_for_completed_tasks(
-                        prev_completed,
-                        round_dir / "sessions",
-                        instances,
-                        memrl_helper,
-                    )
-                    replay_elapsed = time.monotonic() - replay_t0
-                    logger.info(
-                        "MEMRL replay done: %d/%d memories rebuilt in %.1fs (%.1f tasks/s)",
-                        n_replayed,
-                        len(prev_completed),
-                        replay_elapsed,
-                        len(prev_completed) / max(replay_elapsed, 0.1),
-                    )
+                    dm = getattr(memrl_helper.service, "dict_memory", None)
+                    if dm:
+                        logger.info(
+                            "MEMRL caches already populated from checkpoint "
+                            "(%d unique tasks) — skipping replay",
+                            len(dm),
+                        )
+                    else:
+                        replay_t0 = time.monotonic()
+                        logger.info(
+                            "Replaying MEMRL build for %d previously completed tasks...",
+                            len(prev_completed),
+                        )
+                        n_replayed = _replay_memrl_for_completed_tasks(
+                            prev_completed,
+                            round_dir / "sessions",
+                            instances,
+                            memrl_helper,
+                        )
+                        replay_elapsed = time.monotonic() - replay_t0
+                        logger.info(
+                            "MEMRL replay done: %d/%d memories rebuilt in %.1fs (%.1f tasks/s)",
+                            n_replayed,
+                            len(prev_completed),
+                            replay_elapsed,
+                            len(prev_completed) / max(replay_elapsed, 0.1),
+                        )
 
             if remaining_task_ids:
                 logger.info(
@@ -770,26 +780,35 @@ def run_evolution(
                     len(remaining_task_ids),
                 )
                 # Replay MEMRL build for completed tasks
+                # SKIP if caches already populated from checkpoint
                 if memrl_helper:
-                    replay_t0 = time.monotonic()
-                    logger.info(
-                        "Replaying MEMRL build for %d previously completed tasks...",
-                        len(prev_completed),
-                    )
-                    n_replayed = _replay_memrl_for_completed_tasks(
-                        prev_completed,
-                        round_dir / "sessions",
-                        instances,
-                        memrl_helper,
-                    )
-                    replay_elapsed = time.monotonic() - replay_t0
-                    logger.info(
-                        "MEMRL replay done: %d/%d memories rebuilt in %.1fs (%.1f tasks/s)",
-                        n_replayed,
-                        len(prev_completed),
-                        replay_elapsed,
-                        len(prev_completed) / max(replay_elapsed, 0.1),
-                    )
+                    dm = getattr(memrl_helper.service, "dict_memory", None)
+                    if dm and len(dm) >= len(prev_completed):
+                        logger.info(
+                            "MEMRL caches already populated (%d unique tasks) "
+                            "— skipping replay",
+                            len(dm),
+                        )
+                    else:
+                        replay_t0 = time.monotonic()
+                        logger.info(
+                            "Replaying MEMRL build for %d previously completed tasks...",
+                            len(prev_completed),
+                        )
+                        n_replayed = _replay_memrl_for_completed_tasks(
+                            prev_completed,
+                            round_dir / "sessions",
+                            instances,
+                            memrl_helper,
+                        )
+                        replay_elapsed = time.monotonic() - replay_t0
+                        logger.info(
+                            "MEMRL replay done: %d/%d memories rebuilt in %.1fs (%.1f tasks/s)",
+                            n_replayed,
+                            len(prev_completed),
+                            replay_elapsed,
+                            len(prev_completed) / max(replay_elapsed, 0.1),
+                        )
 
             if remaining_task_ids:
                 logger.info(
