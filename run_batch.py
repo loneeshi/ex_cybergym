@@ -561,27 +561,35 @@ class MemRLHelper:
         if not self.service:
             return None
         try:
-            mem_id = self.service.build_memory(
-                task_description=task_description,
-                trajectory=trajectory,
-                metadata=metadata,
-            )
-            # Register in dict_memory so retrieve_query() can find this memory.
-            # build_memory writes to MemOS/Qdrant but skips dict_memory (only
-            # add_memories populates it). Without this, retrieve_query() sees
-            # an empty dict_memory and returns nothing.
-            if mem_id and hasattr(self.service, "dict_memory"):
-                # Pre-compute embedding outside lock (network call may be slow)
-                _new_vec = None
-                embedder = getattr(self.service, "embedding_provider", None)
-                qe = getattr(self.service, "query_embeddings", None)
-                if embedder and qe is not None and task_description not in qe:
-                    try:
-                        _new_vec = embedder.embed([task_description])[0]
-                    except Exception:
-                        pass
+            # Pre-compute embedding OUTSIDE lock (network call may be slow).
+            # This runs concurrently across threads without touching SQLite.
+            _new_vec = None
+            embedder = getattr(self.service, "embedding_provider", None)
+            qe = getattr(self.service, "query_embeddings", None)
+            if (
+                embedder
+                and qe is not None
+                and hasattr(self.service, "dict_memory")
+                and task_description not in qe
+            ):
+                try:
+                    _new_vec = embedder.embed([task_description])[0]
+                except Exception:
+                    pass
 
-                with self._state_lock:
+            # Serialise build_memory + cache update under a single lock.
+            # build_memory() writes to SQLite (user_manager) and local-mode
+            # Qdrant, neither of which is thread-safe for concurrent writes.
+            with self._state_lock:
+                mem_id = self.service.build_memory(
+                    task_description=task_description,
+                    trajectory=trajectory,
+                    metadata=metadata,
+                )
+                # Register in dict_memory so retrieve_query() can find this
+                # memory.  build_memory writes to MemOS/Qdrant but skips
+                # dict_memory (only add_memories populates it).
+                if mem_id and hasattr(self.service, "dict_memory"):
                     dm = self.service.dict_memory
                     if task_description in dm:
                         dm[task_description].append(mem_id)
