@@ -1,0 +1,501 @@
+diff --git a/memrl/service/memory_service.py b/memrl/service/memory_service.py
+index 63bed73..b559d74 100644
+--- a/memrl/service/memory_service.py
++++ b/memrl/service/memory_service.py
+@@ -207,13 +207,21 @@ def _resolve_snapshot_dirs(
+     if isinstance(meta, dict):
+         try:
+             cube_candidate = meta.get("cube_dir")
+-            if isinstance(cube_candidate, str) and cube_candidate and os.path.isdir(cube_candidate):
++            if (
++                isinstance(cube_candidate, str)
++                and cube_candidate
++                and os.path.isdir(cube_candidate)
++            ):
+                 cube_dir = cube_candidate
+         except Exception:
+             pass
+         try:
+             qdrant_candidate = meta.get("qdrant_dir")
+-            if isinstance(qdrant_candidate, str) and qdrant_candidate and os.path.isdir(qdrant_candidate):
++            if (
++                isinstance(qdrant_candidate, str)
++                and qdrant_candidate
++                and os.path.isdir(qdrant_candidate)
++            ):
+                 qdrant_dir = qdrant_candidate
+         except Exception:
+             pass
+@@ -308,12 +316,18 @@ class MemoryService:
+         self.embedding_provider = embedding_provider
+ 
+         # Similarity normalization constants (default from corpus stats; override via kwargs if needed)
+-        self.sim_norm_mean: float = float(kwargs.get("sim_norm_mean", 0.1856827586889267))
+-        self.sim_norm_std: float = float(kwargs.get("sim_norm_std", 0.09407906234264374)) or 1.0
++        self.sim_norm_mean: float = float(
++            kwargs.get("sim_norm_mean", 0.1856827586889267)
++        )
++        self.sim_norm_std: float = (
++            float(kwargs.get("sim_norm_std", 0.09407906234264374)) or 1.0
++        )
+         # Optional: disable z-score normalization in hybrid scoring.
+         # This is intentionally plumbed via kwargs so only selected runners (e.g., LLB)
+         # change behavior without affecting other benchmarks by default.
+-        self.use_z_score_normalization: bool = bool(kwargs.get("use_z_score_normalization", True))
++        self.use_z_score_normalization: bool = bool(
++            kwargs.get("use_z_score_normalization", True)
++        )
+         # Optional: LLB-only Phase-B behavior to reduce repeated same-task memories.
+         self.dedup_by_task_id: bool = bool(kwargs.get("dedup_by_task_id", False))
+ 
+@@ -378,7 +392,7 @@ class MemoryService:
+                 "backend": "qdrant",
+                 "config": {
+                     "collection_name": f"memp_{self.user_id}_{ts_str}",
+-                    "vector_dimension": 3072,
++                    "vector_dimension": 4096,
+                     "distance_metric": "cosine",
+                     "path": qdrant_dir,
+                 },
+@@ -519,6 +533,168 @@ class MemoryService:
+             ",".join(updated) if updated else "(none)",
+         )
+ 
++    def prepare_memory(
++        self,
++        task_description: str,
++        trajectory: str,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> Dict[str, Any]:
++        """Phase 1: LLM calls + content preparation. Thread-safe, no DB writes.
++
++        Returns a dict with all pre-computed data needed by commit_memory().
++        """
++        try:
++            # Extract source benchmark from metadata
++            source_benchmark = (metadata or {}).get("source_benchmark", "unknown")
++            raw_success = (metadata or {}).get("success", None)
++            success = _coerce_success(raw_success)
++            # Preserve task_id for Q-value attribution (enables exact-match
++            # reward assignment instead of unreliable similarity-based proxy).
++            task_id = (metadata or {}).get("task_id", None)
++
++            # Use Builder pattern to generate memory content
++            builder = get_builder(self.strategy_config.build, self.llm_provider)
++            memory_content = builder.build(task_description, trajectory)
++
++            # Create procedural memory based on build strategy
++            if self.strategy_config.build == BuildStrategy.TRAJECTORY:
++                procedural_memory = ProceduralMemory.create_trajectory_memory(
++                    task_description=task_description,
++                    trajectory=memory_content,  # Use builder output
++                    build_strategy=self.strategy_config.build,
++                    retrieve_strategy=self.strategy_config.retrieve,
++                    update_strategy=self.strategy_config.update,
++                    source_benchmark=source_benchmark,
++                    confidence_score=self.memory_confidence,
++                )
++
++            elif self.strategy_config.build == BuildStrategy.SCRIPT:
++                procedural_memory = ProceduralMemory.create_script_memory(
++                    task_description=task_description,
++                    script=memory_content,  # Use builder output
++                    trajectory=trajectory,  # Keep original trajectory for reference
++                    build_strategy=self.strategy_config.build,
++                    retrieve_strategy=self.strategy_config.retrieve,
++                    update_strategy=self.strategy_config.update,
++                    source_benchmark=source_benchmark,
++                    confidence_score=self.memory_confidence,
++                )
++
++            else:  # BuildStrategy.PROCEDURALIZATION
++                # For proceduralization, the builder returns combined content
++                # Extract script from the combined content for metadata
++                lines = memory_content.split("\n")
++                script_start = None
++                trajectory_start = None
++
++                for i, line in enumerate(lines):
++                    if line.strip() == "SCRIPT:":
++                        script_start = i + 1
++                    elif line.strip() == "TRAJECTORY:":
++                        trajectory_start = i + 1
++                        break
++
++                if script_start is not None and trajectory_start is not None:
++                    script = "\n".join(
++                        lines[script_start : trajectory_start - 2]
++                    ).strip()
++                else:
++                    # Fallback: generate script separately if parsing fails
++                    script = self.llm_provider.generate_script(trajectory)
++
++                procedural_memory = ProceduralMemory.create_procedural_memory(
++                    task_description=task_description,
++                    script=script,
++                    trajectory=trajectory,
++                    build_strategy=self.strategy_config.build,
++                    retrieve_strategy=self.strategy_config.retrieve,
++                    update_strategy=self.strategy_config.update,
++                    source_benchmark=source_benchmark,
++                    confidence_score=self.memory_confidence,
++                )
++
++            # Generate retrieval keys if needed
++            if self.strategy_config.retrieve == RetrieveStrategy.AVEFACT:
++                keywords = self.llm_provider.extract_keywords(
++                    task_description, self.max_keywords
++                )
++                avefact_vector = self.avefact_keyer.generate_key(task_description)
++                procedural_memory.memp_metadata.avefact_keywords = keywords
++                procedural_memory.memp_metadata.avefact_vector = avefact_vector
++            elif self.strategy_config.retrieve == RetrieveStrategy.QUERY:
++                query_vector = self.simple_keyer.generate_key(task_description)
++                procedural_memory.memp_metadata.query_vector = query_vector
++
++            # Build full_content and base_meta for commit phase
++            full_content = (
++                f"Task: {task_description}\n\n{procedural_memory.memory_content}"
++            )
++
++            base_meta = {
++                "type": "procedure",
++                "source": "conversation",
++                "source_benchmark": source_benchmark,
++                "success": success,
++                "task_id": task_id,
++                "strategy_build": self.strategy_config.build.value,
++                "strategy_retrieve": self.strategy_config.retrieve.value,
++                "strategy_update": self.strategy_config.update.value,
++                "confidence": self.memory_confidence,
++                "full_content": full_content,
++            }
++            # Initialize value fields when enabled
++            if (
++                getattr(self, "enable_value_driven", False)
++                and getattr(self, "rl_config", None) is not None
++            ):
++                # User-selected behavior: unknown success defaults to q_init_pos.
++                is_success = True if success is None else bool(success)
++                base_meta |= {
++                    "q_value": (
++                        float(self.rl_config.q_init_pos)
++                        if is_success
++                        else float(self.rl_config.q_init_neg)
++                    ),
++                    "q_visits": 0,
++                    "q_updated_at": datetime.now().isoformat(),
++                    "last_used_at": datetime.now().isoformat(),
++                    "reward_ma": 0.0,
++                }
++
++            return {
++                "task_description": task_description,
++                "full_content": full_content,
++                "base_meta": base_meta,
++                "success": success,
++            }
++
++        except Exception as e:
++            raise RuntimeError(f"Failed to prepare memory: {e}")
++
++    def commit_memory(self, prepared: Dict[str, Any]) -> str:
++        """Phase 2: Write pre-computed memory to MemOS. NOT thread-safe — caller must hold lock.
++
++        Returns the memory ID.
++        """
++        task_description = prepared["task_description"]
++        base_meta = prepared["base_meta"]
++
++        mem_cube_id = getattr(self, "default_cube_id", None)
++        if mem_cube_id is None or mem_cube_id not in self.mos.mem_cubes:
++            raise RuntimeError(
++                "MemCube is not registered for the user or default_cube_id is missing"
++            )
++        text_mem = self.mos.mem_cubes[mem_cube_id].text_mem
++        if text_mem is None:
++            raise RuntimeError("Textual memory is not initialized in the MemCube")
++
++        item = TextualMemoryItem(
++            memory=task_description,
++            metadata=TextualMemoryMetadata(**base_meta),
++        )
++        text_mem.add([item])
++        return str(item.id)
++
+     def build_memory(
+         self,
+         task_description: str,
+@@ -772,7 +948,7 @@ class MemoryService:
+         memory_id: Optional[str],
+         reward: float,
+         *,
+-        next_max_q: Optional[float] = None
++        next_max_q: Optional[float] = None,
+     ) -> Optional[float]:
+         """
+         Update Q-value for the selected memory. If memory_id is None (null action),
+@@ -780,7 +956,10 @@ class MemoryService:
+ 
+         Returns the new Q if updated, else None.
+         """
+-        if not getattr(self, 'enable_value_driven', False) or getattr(self, '_q_updater', None) is None:
++        if (
++            not getattr(self, "enable_value_driven", False)
++            or getattr(self, "_q_updater", None) is None
++        ):
+             return None
+         if memory_id is None:
+             return None
+@@ -789,8 +968,9 @@ class MemoryService:
+         except Exception as e:
+             raise RuntimeError(f"Failed to update Q-value: {e}")
+ 
+-
+-    def update_values(self, successes: list[float], retrieved_ids_list: list[list[str]]) -> dict[str, Optional[float]]:
++    def update_values(
++        self, successes: list[float], retrieved_ids_list: list[list[str]]
++    ) -> dict[str, Optional[float]]:
+         """
+         Concurrently update Q-values for all retrieved memory_ids.
+ 
+@@ -1235,14 +1415,15 @@ class MemoryService:
+             print(f"[add_memory] Error: {e}\n{traceback.format_exc()}")
+             return None
+ 
+-
+     def _normalize_similarity(self, sim: float) -> float:
+         """Z-norm similarity using precomputed mean/std."""
+         if not getattr(self, "use_z_score_normalization", True):
+             return float(sim)
+-        std = self.sim_norm_std if self.sim_norm_std and self.sim_norm_std > 1e-9 else 1.0
++        std = (
++            self.sim_norm_std if self.sim_norm_std and self.sim_norm_std > 1e-9 else 1.0
++        )
+         return (sim - self.sim_norm_mean) / std
+-    
++
+     def _normalize_q(self, q: float, mean: float, std: float) -> float:
+         """Z-norm q using provided mean/std (per-call stats)."""
+         if not getattr(self, "use_z_score_normalization", True):
+@@ -1417,7 +1598,7 @@ class MemoryService:
+ 
+                 c_local = dict(c)
+                 c_local["q_estimate"] = q
+-                c_local["task_id"] = (str(task_id) if task_id is not None else None)
++                c_local["task_id"] = str(task_id) if task_id is not None else None
+                 q_values.append(q)
+                 enriched.append(c_local)
+ 
+@@ -1484,7 +1665,11 @@ class MemoryService:
+                 for cand in pool:
+                     tid = cand.get("task_id")
+                     # If task_id missing, treat as unique by memory_id to avoid collapsing unrelated entries.
+-                    key = str(tid) if tid else f"__missing_task_id__:{cand.get('memory_id')}"
++                    key = (
++                        str(tid)
++                        if tid
++                        else f"__missing_task_id__:{cand.get('memory_id')}"
++                    )
+                     if key in seen_tasks:
+                         continue
+                     seen_tasks.add(key)
+@@ -1684,8 +1869,6 @@ class MemoryService:
+         # 清理旧目录以保证原子性
+         if os.path.isdir(cube_dst):
+             shutil.rmtree(cube_dst)
+-        if os.path.isdir(qdrant_dst):
+-            shutil.rmtree(qdrant_dst)
+         # 1) dump cube 到全新目录（包含 textual_memory.json：完整向量与payload）
+         cube_id = getattr(self, "default_cube_id", None)
+         cube = self.mos.mem_cubes.get(cube_id) if cube_id else None
+@@ -1695,23 +1878,40 @@ class MemoryService:
+         # 2) 拷贝 qdrant 文件目录（便于直接加载；如失败不影响最小可复现）
+         qdrant_src = getattr(self, "_qdrant_dir", None)
+         qdrant_copied = False
+-        if qdrant_src and os.path.isdir(qdrant_src):
+-            try:
+-                shutil.copytree(qdrant_src, qdrant_dst)
+-                qdrant_copied = True
+-            except Exception:
+-                # Snapshot can still be loadable (qdrant can be rebuilt from cube dump),
+-                # but we must not write qdrant_dir=None to meta (it breaks loaders).
+-                logger.warning(
+-                    "Failed to copy qdrant dir from %s to %s; will keep empty qdrant dir and continue.",
+-                    qdrant_src,
+-                    qdrant_dst,
+-                    exc_info=True,
+-                )
++
++        # Avoid deleting qdrant_dst if it IS the live working qdrant dir
++        qdrant_src_real = os.path.realpath(qdrant_src) if qdrant_src else None
++        qdrant_dst_real = os.path.realpath(qdrant_dst)
++        same_dir = qdrant_src_real and qdrant_src_real == qdrant_dst_real
++
++        if same_dir:
++            # Source IS destination — the working qdrant is already in the
++            # snapshot tree (shouldn't happen after the load fix, but handle
++            # gracefully).  Do NOT delete; mark as already copied.
++            logger.info(
++                "save_checkpoint: qdrant_src == qdrant_dst (%s); skipping copy",
++                qdrant_src,
++            )
++            qdrant_copied = True
++        else:
++            # Safe to clean old snapshot qdrant and copy fresh
++            if os.path.isdir(qdrant_dst):
++                shutil.rmtree(qdrant_dst)
++            if qdrant_src and os.path.isdir(qdrant_src):
+                 try:
+-                    os.makedirs(qdrant_dst, exist_ok=True)
++                    shutil.copytree(qdrant_src, qdrant_dst)
++                    qdrant_copied = True
+                 except Exception:
+-                    pass
++                    logger.warning(
++                        "Failed to copy qdrant dir from %s to %s; will keep empty qdrant dir and continue.",
++                        qdrant_src,
++                        qdrant_dst,
++                        exc_info=True,
++                    )
++                    try:
++                        os.makedirs(qdrant_dst, exist_ok=True)
++                    except Exception:
++                        pass
+         # 3) 统计与校验
+         textual_path = os.path.join(cube_dst, "textual_memory.json")
+         md5 = None
+@@ -1810,6 +2010,54 @@ class MemoryService:
+                 pass
+         if not os.path.isdir(cube_dir):
+             raise ValueError(f"Snapshot cube directory not found: {cube_dir}")
++
++        # CRITICAL: Never use the snapshot qdrant dir directly for writes.
++        # Copy it to a fresh working directory so Round N+1 writes don't
++        # corrupt the Round N checkpoint, and the save_checkpoint_snapshot
++        # at end-of-round doesn't delete the live DB.
++        snapshot_qdrant_dir = qdrant_dir
++        if not isinstance(snapshot_qdrant_dir, str) or not snapshot_qdrant_dir:
++            snapshot_qdrant_dir = os.path.join(snapshot_root, "qdrant")
++
++        base_root = getattr(self, "_base_root", "./results/mem_cubes")
++        ts_work = datetime.now().strftime("%Y%m%d_%H%M%S")
++        working_qdrant = os.path.abspath(
++            os.path.join(base_root, "..", "qdrant", self.user_id, f"ckpt_{ts_work}")
++        )
++
++        snapshot_qdrant_has_data = os.path.isdir(snapshot_qdrant_dir) and any(
++            f.endswith((".sqlite", ".wal", ".db"))
++            for f in os.listdir(snapshot_qdrant_dir)
++            if os.path.isfile(os.path.join(snapshot_qdrant_dir, f))
++        )
++
++        if snapshot_qdrant_has_data:
++            try:
++                if os.path.isdir(working_qdrant):
++                    shutil.rmtree(working_qdrant)
++                shutil.copytree(snapshot_qdrant_dir, working_qdrant)
++                logger.info(
++                    "Copied snapshot qdrant %s → working dir %s",
++                    snapshot_qdrant_dir,
++                    working_qdrant,
++                )
++            except Exception:
++                logger.warning(
++                    "Failed to copy snapshot qdrant to working dir; will rebuild from cube",
++                    exc_info=True,
++                )
++                os.makedirs(working_qdrant, exist_ok=True)
++        else:
++            logger.info(
++                "Snapshot qdrant dir %s empty or missing; will rebuild from cube into %s",
++                snapshot_qdrant_dir,
++                working_qdrant,
++            )
++            os.makedirs(working_qdrant, exist_ok=True)
++
++        # Use the working directory for all qdrant operations
++        qdrant_dir = working_qdrant
++
+         # 构造 default_config 以覆盖向量库路径与基础 provider 配置
+         chat = self.mos_config.chat_model
+         openai_cfg = chat.config.model_dump()
+@@ -1837,7 +2085,7 @@ class MemoryService:
+                         "backend": "qdrant",
+                         "config": {
+                             "collection_name": f"memp_{self.user_id}_snapshot",
+-                            "vector_dimension": 3072,
++                            "vector_dimension": 4096,
+                             "distance_metric": "cosine",
+                             "path": qdrant_dir,
+                         },
+@@ -1847,21 +2095,13 @@ class MemoryService:
+             act_mem={"backend": "uninitialized", "config": {}},
+             para_mem={"backend": "uninitialized", "config": {}},
+         )
+-        # 载入并注册
+-        # Ensure qdrant directory exists; QdrantLocal will create internal sqlite files.
+-        if not isinstance(qdrant_dir, str) or not qdrant_dir:
+-            qdrant_dir = os.path.join(snapshot_root, "qdrant")
+-        try:
+-            os.makedirs(qdrant_dir, exist_ok=True)
+-        except Exception:
+-            logger.warning("Failed to ensure qdrant_dir exists: %r", qdrant_dir, exc_info=True)
+ 
+         def _is_sqlite_malformed(err: Exception) -> bool:
+             msg = str(err).lower()
+             return (
+                 isinstance(err, sqlite3.DatabaseError)
+                 or "database disk image is malformed" in msg
+-                or "sqlite" in msg and "malformed" in msg
++                or ("sqlite" in msg and "malformed" in msg)
+             )
+ 
+         try:
+@@ -1894,7 +2134,9 @@ class MemoryService:
+                     except Exception:
+                         pass
+                 os.makedirs(qdrant_dir, exist_ok=True)
+-                cube = GeneralMemCube.init_from_dir(cube_dir, default_config=default_cfg)
++                cube = GeneralMemCube.init_from_dir(
++                    cube_dir, default_config=default_cfg
++                )
+             else:
+                 raise
+         target_id = mem_cube_id or f"cube_{self.user_id}_snapshot"
+@@ -2013,14 +2255,27 @@ class MemoryService:
+         embed = getattr(self.embedding_provider, "embed", None)
+         if missing_queries and callable(embed):
+             batch_size = getattr(self, "embedding_batch_size", 256)
+-            for start in tqdm(
+-                range(0, len(missing_queries), batch_size),
+-                desc="Rebuilding query embeddings",
+-            ):
+-                batch_queries = missing_queries[start : start + batch_size]
+-                batch_vecs = get_embedding_with_retry(embed, batch_queries)
+-                for q, v in zip(batch_queries, batch_vecs):
+-                    query_embeddings[q] = v
++            max_workers = getattr(self, "embedding_rebuild_workers", 8)
++            batches = [
++                missing_queries[start : start + batch_size]
++                for start in range(0, len(missing_queries), batch_size)
++            ]
++            local_results: dict[str, list] = {}
++            with ThreadPoolExecutor(max_workers=max_workers) as executor:
++                future_to_batch = {
++                    executor.submit(get_embedding_with_retry, embed, batch): batch
++                    for batch in batches
++                }
++                with tqdm(
++                    total=len(batches), desc="Rebuilding query embeddings"
++                ) as pbar:
++                    for future in as_completed(future_to_batch):
++                        batch_queries = future_to_batch[future]
++                        batch_vecs = future.result()
++                        for q, v in zip(batch_queries, batch_vecs):
++                            local_results[q] = v
++                        pbar.update(1)
++            query_embeddings.update(local_results)
+             self.query_embeddings.update(query_embeddings)
+ 
+         return added
