@@ -224,10 +224,12 @@ def _replay_memrl_for_completed_tasks(
             },
         )
         if mem_id:
-            memrl.update_values(
-                [1.0 if real_success else 0.0],
-                [[mem_id]],
-            )
+            # NOTE: Do NOT call update_values() here.  build_memory() already
+            # initialises q_value to q_init_pos/q_init_neg based on the
+            # ``success`` metadata flag.  If a checkpoint exists, the stored
+            # Q-values already reflect the original run's updates.  Calling
+            # update_values() again would double-count the reward, inflating
+            # Q-values for successful tasks and deflating them for failures.
             return 1
         return 0
 
@@ -498,6 +500,122 @@ async def run_single_round(
     )
 
 
+# ── Intra-round retry for error/timeout tasks ────────────────────────
+
+MAX_RETRY_PASSES = 2
+RETRY_TIMEOUT_BUMP = 1000  # extra seconds per retry pass for timeout tasks
+RETRY_CONCURRENCY_CAP = 16  # lower concurrency for retries to protect server
+
+
+def _retry_failed_tasks(
+    round_num: int,
+    all_results: list[dict[str, Any]],
+    *,
+    server: str,
+    task_ids_full: list[str],
+    instances: dict[str, dict[str, Any]],
+    model: str,
+    level: str,
+    concurrency: int,
+    base_timeout: int,
+    step_limit: int,
+    output_dir: Path,
+    memrl: Optional[MemRLHelper],
+    cybergym_server: Optional[str] = None,
+    memrl_build_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Retry error/timeout tasks with bumped timeout.
+
+    - error tasks: retried with same timeout
+    - timeout tasks: retried with timeout + RETRY_TIMEOUT_BUMP per pass
+    - Concurrency is capped at RETRY_CONCURRENCY_CAP to protect the server
+      (retried tasks are typically harder / longer-running)
+    - Max RETRY_PASSES attempts; stops early if no failures remain
+
+    Returns the updated full results list (failed entries replaced).
+    """
+    # Build lookup: base_task_id → result
+    results_by_tid: dict[str, dict[str, Any]] = {}
+    for r in all_results:
+        tid = r.get("task_id", "")
+        base = tid.split("/")[0] if "/" in tid else tid
+        results_by_tid[base] = r
+
+    for retry_pass in range(1, MAX_RETRY_PASSES + 1):
+        failed_tids = [
+            tid
+            for tid, r in results_by_tid.items()
+            if r.get("status") in ("error", "timeout")
+        ]
+        if not failed_tids:
+            break
+
+        retry_timeout = base_timeout + RETRY_TIMEOUT_BUMP * retry_pass
+        retry_concurrency = max(1, min(RETRY_CONCURRENCY_CAP, len(failed_tids)))
+
+        n_err = sum(
+            1 for t in failed_tids if results_by_tid[t].get("status") == "error"
+        )
+        n_tout = sum(
+            1 for t in failed_tids if results_by_tid[t].get("status") == "timeout"
+        )
+        logger.info(
+            "Round %d retry pass %d/%d: %d tasks "
+            "(error=%d, timeout=%d) — timeout=%ds, concurrency=%d",
+            round_num,
+            retry_pass,
+            MAX_RETRY_PASSES,
+            len(failed_tids),
+            n_err,
+            n_tout,
+            retry_timeout,
+            retry_concurrency,
+        )
+
+        retry_results = asyncio.run(
+            run_single_round(
+                round_num=round_num,
+                server=server,
+                task_ids=failed_tids,
+                instances=instances,
+                model=model,
+                level=level,
+                concurrency=retry_concurrency,
+                timeout=retry_timeout,
+                step_limit=step_limit,
+                output_dir=output_dir,
+                memrl=memrl,
+                cybergym_server=cybergym_server,
+                memrl_build_only=memrl_build_only,
+            )
+        )
+
+        # Merge: replace old failed entries with retry results
+        n_recovered = 0
+        for r in retry_results:
+            tid = r.get("task_id", "")
+            base = tid.split("/")[0] if "/" in tid else tid
+            old_status = results_by_tid.get(base, {}).get("status")
+            results_by_tid[base] = r
+            if r.get("status") == "completed" and old_status in ("error", "timeout"):
+                n_recovered += 1
+
+        n_still_failed = sum(
+            1
+            for r in results_by_tid.values()
+            if r.get("status") in ("error", "timeout")
+        )
+        logger.info(
+            "Round %d retry pass %d done: recovered=%d, still_failed=%d",
+            round_num,
+            retry_pass,
+            n_recovered,
+            n_still_failed,
+        )
+
+    return list(results_by_tid.values())
+
+
 def run_evolution(
     server: str,
     model: str,
@@ -763,6 +881,31 @@ def run_evolution(
 
             # Merge: previously completed + newly run
             results = prev_completed + new_results
+
+            # ── Retry error/timeout tasks with bumped timeout ──
+            n_failed = sum(
+                1 for r in results if r.get("status") in ("error", "timeout")
+            )
+            if n_failed > 0:
+                logger.info(
+                    "Round 1: %d error/timeout tasks — starting retry passes", n_failed
+                )
+                results = _retry_failed_tasks(
+                    round_num,
+                    results,
+                    server=server,
+                    task_ids_full=task_ids,
+                    instances=instances,
+                    model=model,
+                    level=level,
+                    concurrency=concurrency,
+                    base_timeout=timeout,
+                    step_limit=step_limit,
+                    output_dir=round_dir,
+                    memrl=memrl_helper,
+                    cybergym_server=cybergym_server,
+                    memrl_build_only=True,
+                )
         else:
             # Round 2+: memrl retrieves memories, inline validation for reward
             # ── Intra-round resume: skip already-completed tasks ──
@@ -858,6 +1001,33 @@ def run_evolution(
                 )
 
             results = prev_completed + new_results
+
+            # ── Retry error/timeout tasks with bumped timeout ──
+            n_failed = sum(
+                1 for r in results if r.get("status") in ("error", "timeout")
+            )
+            if n_failed > 0:
+                logger.info(
+                    "Round %d: %d error/timeout tasks — starting retry passes",
+                    round_num,
+                    n_failed,
+                )
+                results = _retry_failed_tasks(
+                    round_num,
+                    results,
+                    server=server,
+                    task_ids_full=task_ids,
+                    instances=instances,
+                    model=model,
+                    level=level,
+                    concurrency=concurrency,
+                    base_timeout=timeout,
+                    step_limit=step_limit,
+                    output_dir=round_dir,
+                    memrl=memrl_helper,
+                    cybergym_server=cybergym_server,
+                    memrl_build_only=False,
+                )
         round_elapsed = time.monotonic() - round_t0
 
         # Print per-round summary (reuse existing function)

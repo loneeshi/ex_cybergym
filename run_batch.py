@@ -444,10 +444,19 @@ class MemRLHelper:
                 logger.info(
                     "MEMRL loaded checkpoint: %s (%d memories)", resolved_ckpt, n
                 )
-                # Rebuild in-memory caches (dict_memory, query_embeddings) from
-                # checkpoint data so retrieve_query() works immediately without
-                # replaying build_memory() for every past task.
-                self._rebuild_caches_from_checkpoint(checkpoint_path)
+                # load_checkpoint_snapshot already tries _restore_local_caches
+                # (from local_cache/*.json) and falls back to
+                # _rebuild_local_memory_index (re-embeds via API).  Only run
+                # our lightweight textual_memory.json reader as a last resort
+                # when dict_memory is still empty (e.g. old-format checkpoint
+                # without local_cache/ and failed API-based rebuild).
+                dm = getattr(self.service, "dict_memory", None)
+                if not dm:
+                    logger.info(
+                        "dict_memory still empty after load_checkpoint_snapshot "
+                        "— falling back to _rebuild_caches_from_checkpoint"
+                    )
+                    self._rebuild_caches_from_checkpoint(checkpoint_path)
             else:
                 logger.info("MEMRL initialized (no checkpoint)")
 
@@ -509,19 +518,31 @@ class MemRLHelper:
             qe = getattr(self.service, "query_embeddings", None)
             n_loaded = 0
 
+            # DEDUP FIX: When loading from checkpoint, keep only the
+            # best memory per task_description (highest Q-value). Old
+            # checkpoints may contain duplicates from the pre-fix runs.
+            best_per_task: dict[str, tuple[str, float, list | None]] = {}
             for point in points:
                 payload = point.get("payload", {})
                 task_desc = payload.get("memory", "")
                 mem_id = payload.get("id", "")
                 vector = point.get("vector")
+                meta = payload.get("metadata", {})
+                q_value = (
+                    float(meta.get("q_value", 0.0)) if isinstance(meta, dict) else 0.0
+                )
 
                 if not task_desc or not mem_id:
                     continue
 
-                if task_desc in dm:
-                    dm[task_desc].append(mem_id)
-                else:
-                    dm[task_desc] = [mem_id]
+                if (
+                    task_desc not in best_per_task
+                    or q_value > best_per_task[task_desc][1]
+                ):
+                    best_per_task[task_desc] = (mem_id, q_value, vector)
+
+            for task_desc, (mem_id, q_value, vector) in best_per_task.items():
+                dm[task_desc] = [mem_id]
 
                 if qe is not None and vector and task_desc not in qe:
                     qe[task_desc] = vector
@@ -540,7 +561,7 @@ class MemRLHelper:
             logger.warning("Failed to rebuild caches from checkpoint: %s", e)
             return 0
 
-    def retrieve(self, query: str) -> tuple[str, list[str]]:
+    def retrieve(self, query: str) -> tuple[str, list[str], dict[str, str | None]]:
         """Retrieve relevant memories and format as prompt context.
 
         When value-driven RL is enabled, uses retrieve_query() for hybrid
@@ -548,10 +569,11 @@ class MemRLHelper:
         Otherwise falls back to pure similarity retrieval.
 
         Returns:
-            (formatted_prompt_text, list_of_retrieved_memory_ids)
+            (formatted_prompt_text, list_of_retrieved_memory_ids,
+             dict mapping memory_id → source_task_id or None)
         """
         if not self.service:
-            return "", []
+            return "", [], {}
         try:
             k = getattr(self.config.memory, "k_retrieve", 3)
             threshold = getattr(self.config.memory, "confidence_threshold", 0.0)
@@ -561,6 +583,8 @@ class MemRLHelper:
                 and hasattr(self.service, "retrieve_query")
                 and getattr(self.service, "dict_memory", None)
             )
+
+            mem_task_ids: dict[str, str | None] = {}
 
             if use_value_driven:
                 results = self.service.retrieve_query(
@@ -575,17 +599,21 @@ class MemRLHelper:
                         results.get("selected", []) if isinstance(results, dict) else []
                     )
                 if not selected:
-                    return "", []
+                    return "", [], {}
                 memory_ids = [
                     mem["memory_id"]
                     for mem in selected
                     if mem.get("memory_id") and mem["memory_id"] != "unknown"
                 ]
+                for mem in selected:
+                    mid = mem.get("memory_id")
+                    if mid and mid != "unknown":
+                        mem_task_ids[mid] = mem.get("task_id")
                 memories = selected
             else:
                 memories = self.service.retrieve(query, k=k, threshold=threshold)
                 if not memories:
-                    return "", []
+                    return "", [], {}
                 memory_ids = [
                     mem["memory_id"]
                     for mem in memories
@@ -601,12 +629,12 @@ class MemRLHelper:
                     content = content[:2000] + "\n... (truncated)"
                 parts.append(f"[Experience {i}]\n{content}")
             if not parts:
-                return "", memory_ids
+                return "", memory_ids, mem_task_ids
             text = MEMORY_CONTEXT_TEMPLATE.format(memories="\n\n".join(parts))
-            return text, memory_ids
+            return text, memory_ids, mem_task_ids
         except Exception as e:
             logger.warning("Memory retrieval failed: %s", e)
-            return "", []
+            return "", [], {}
 
     def update_values(
         self, successes: list[float], retrieved_ids_list: list[list[str]]
@@ -639,12 +667,34 @@ class MemRLHelper:
         build_memory() alone only writes to MemOS but does NOT populate the
         in-process caches that retrieve_query() depends on.
 
+        DEDUP FIX: If a memory for this exact task_description already exists
+        in dict_memory, we skip creating a new entry and return the existing
+        memory_id instead. This prevents the same task from accumulating
+        duplicate memory entries across rounds (the root cause of 300 unique
+        texts appearing as 2700+ entries). The existing memory's Q-value
+        will be updated separately by the caller via update_values().
+
         NOTE: Q-value update is NOT done here — the caller decides when to
         update (inline per-task for Round 2+, batch after all tasks for Round 1).
         """
         if not self.service:
             return None
         try:
+            # DEDUP CHECK: If we already have a memory for this exact
+            # task_description, return the existing memory_id without
+            # creating a duplicate. This is the primary dedup mechanism.
+            dm = getattr(self.service, "dict_memory", None)
+            if dm is not None and task_description in dm:
+                existing_ids = dm[task_description]
+                if existing_ids:
+                    existing_id = existing_ids[0]
+                    logger.debug(
+                        "Memory already exists for task '%s' (id=%s) — skipping duplicate build",
+                        task_description[:60],
+                        existing_id,
+                    )
+                    return existing_id
+
             # Pre-compute embedding OUTSIDE lock (network call may be slow).
             # This runs concurrently across threads without touching SQLite.
             _new_vec = None
@@ -661,18 +711,22 @@ class MemRLHelper:
                 except Exception:
                     pass
 
-            # Serialise build_memory + cache update under a single lock.
-            # build_memory() writes to SQLite (user_manager) and local-mode
-            # Qdrant, neither of which is thread-safe for concurrent writes.
+            # Phase 1: LLM call + content preparation OUTSIDE lock.
+            # This is the expensive part (2-5s for PROCEDURALIZATION strategy).
+            # Multiple threads can run prepare_memory concurrently.
+            prepared = self.service.prepare_memory(
+                task_description=task_description,
+                trajectory=trajectory,
+                metadata=metadata,
+            )
+
+            # Phase 2: DB write + cache update INSIDE lock (fast, ~0.1s).
             with self._state_lock:
-                mem_id = self.service.build_memory(
-                    task_description=task_description,
-                    trajectory=trajectory,
-                    metadata=metadata,
-                )
-                # Register in dict_memory so retrieve_query() can find this
-                # memory.  build_memory writes to MemOS/Qdrant but skips
-                # dict_memory (only add_memories populates it).
+                # Double-check inside lock (another thread may have built it)
+                if dm is not None and task_description in dm and dm[task_description]:
+                    return dm[task_description][0]
+
+                mem_id = self.service.commit_memory(prepared)
                 if mem_id and hasattr(self.service, "dict_memory"):
                     dm = self.service.dict_memory
                     if task_description in dm:
@@ -1136,12 +1190,17 @@ async def run_batch(
 
             memory_context = ""
             retrieved_ids: list[str] = []
+            retrieved_mem_task_ids: dict[str, str | None] = {}
             if memrl and not memrl_build_only:
                 query = (
                     f"{instance.get('vulnerability_description', '')} "
                     f"{instance.get('crash_type', '')}"
                 )
-                memory_context, retrieved_ids = await asyncio.to_thread(
+                (
+                    memory_context,
+                    retrieved_ids,
+                    retrieved_mem_task_ids,
+                ) = await asyncio.to_thread(
                     memrl.retrieve,
                     query,
                 )
@@ -1263,12 +1322,42 @@ async def run_batch(
 
             if memrl:
                 # ── Update Q-values for retrieved memories (RL feedback) ──
+                # ASYMMETRIC Q-VALUE ATTRIBUTION:
+                # The memory embedding key IS the task_description (vulnerability
+                # description), so cross-task cosine similarity can reach 0.81
+                # for unrelated tasks with similar bug types. This means we
+                # can't use similarity to distinguish "same task" from "similar
+                # task". Instead we use task_id for precise attribution:
+                #
+                # - SUCCESS → reward ALL retrieved memories (cross-task memories
+                #   that were retrieved and led to success may have been helpful)
+                # - FAILURE → only penalize SAME-TASK memory (cross-task memories
+                #   are blameless for a different task's failure)
+                #
+                # This prevents the core pathology: good memories getting their
+                # Q-values destroyed because unrelated hard tasks retrieved them.
                 if retrieved_ids:
-                    await asyncio.to_thread(
-                        memrl.update_values,
-                        [1.0 if real_success else 0.0],
-                        [retrieved_ids],
-                    )
+                    if real_success:
+                        await asyncio.to_thread(
+                            memrl.update_values,
+                            [1.0],
+                            [retrieved_ids],
+                        )
+                    elif retrieved_mem_task_ids:
+                        current_task_base = (
+                            task_id.split("/")[0] if "/" in task_id else task_id
+                        )
+                        same_task_ids = [
+                            mid
+                            for mid in retrieved_ids
+                            if retrieved_mem_task_ids.get(mid) == current_task_base
+                        ]
+                        if same_task_ids:
+                            await asyncio.to_thread(
+                                memrl.update_values,
+                                [0.0],
+                                [same_task_ids],
+                            )
 
                 # Build rich trajectory from saved session file
                 session_file = sessions_dir / f"{safe_name}.json"
