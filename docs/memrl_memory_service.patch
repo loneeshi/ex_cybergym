@@ -1,5 +1,5 @@
 diff --git a/memrl/service/memory_service.py b/memrl/service/memory_service.py
-index 63bed73..b559d74 100644
+index 63bed73..833321a 100644
 --- a/memrl/service/memory_service.py
 +++ b/memrl/service/memory_service.py
 @@ -207,13 +207,21 @@ def _resolve_snapshot_dirs(
@@ -57,7 +57,7 @@ index 63bed73..b559d74 100644
                      "distance_metric": "cosine",
                      "path": qdrant_dir,
                  },
-@@ -519,6 +533,168 @@ class MemoryService:
+@@ -519,6 +533,164 @@ class MemoryService:
              ",".join(updated) if updated else "(none)",
          )
  
@@ -175,14 +175,10 @@ index 63bed73..b559d74 100644
 +                getattr(self, "enable_value_driven", False)
 +                and getattr(self, "rl_config", None) is not None
 +            ):
-+                # User-selected behavior: unknown success defaults to q_init_pos.
-+                is_success = True if success is None else bool(success)
++                # Paper Table 8: unified Q_init=0.0 for all memories regardless
++                # of success/failure. Q differentiates over time via RL updates.
 +                base_meta |= {
-+                    "q_value": (
-+                        float(self.rl_config.q_init_pos)
-+                        if is_success
-+                        else float(self.rl_config.q_init_neg)
-+                    ),
++                    "q_value": float(self.rl_config.q_init_pos),
 +                    "q_visits": 0,
 +                    "q_updated_at": datetime.now().isoformat(),
 +                    "last_used_at": datetime.now().isoformat(),
@@ -226,7 +222,25 @@ index 63bed73..b559d74 100644
      def build_memory(
          self,
          task_description: str,
-@@ -772,7 +948,7 @@ class MemoryService:
+@@ -651,14 +823,10 @@ class MemoryService:
+                 getattr(self, "enable_value_driven", False)
+                 and getattr(self, "rl_config", None) is not None
+             ):
+-                # User-selected behavior: unknown success defaults to q_init_pos.
+-                is_success = True if success is None else bool(success)
++                # Paper Table 8: unified Q_init=0.0 for all memories regardless
++                # of success/failure. Q differentiates over time via RL updates.
+                 base_meta |= {
+-                    "q_value": (
+-                        float(self.rl_config.q_init_pos)
+-                        if is_success
+-                        else float(self.rl_config.q_init_neg)
+-                    ),
++                    "q_value": float(self.rl_config.q_init_pos),
+                     "q_visits": 0,
+                     "q_updated_at": datetime.now().isoformat(),
+                     "last_used_at": datetime.now().isoformat(),
+@@ -772,7 +940,7 @@ class MemoryService:
          memory_id: Optional[str],
          reward: float,
          *,
@@ -235,7 +249,7 @@ index 63bed73..b559d74 100644
      ) -> Optional[float]:
          """
          Update Q-value for the selected memory. If memory_id is None (null action),
-@@ -780,7 +956,10 @@ class MemoryService:
+@@ -780,7 +948,10 @@ class MemoryService:
  
          Returns the new Q if updated, else None.
          """
@@ -247,7 +261,7 @@ index 63bed73..b559d74 100644
              return None
          if memory_id is None:
              return None
-@@ -789,8 +968,9 @@ class MemoryService:
+@@ -789,8 +960,9 @@ class MemoryService:
          except Exception as e:
              raise RuntimeError(f"Failed to update Q-value: {e}")
  
@@ -259,7 +273,25 @@ index 63bed73..b559d74 100644
          """
          Concurrently update Q-values for all retrieved memory_ids.
  
-@@ -1235,14 +1415,15 @@ class MemoryService:
+@@ -1083,14 +1255,10 @@ class MemoryService:
+             getattr(self, "enable_value_driven", False)
+             and getattr(self, "rl_config", None) is not None
+         ):
+-            # User-selected behavior: unknown success defaults to q_init_pos.
+-            is_success = True if success is None else bool(success)
++            # Paper Table 8: unified Q_init=0.0 for all memories regardless
++            # of success/failure. Q differentiates over time via RL updates.
+             base_meta |= {
+-                "q_value": (
+-                    float(self.rl_config.q_init_pos)
+-                    if is_success
+-                    else float(self.rl_config.q_init_neg)
+-                ),
++                "q_value": float(self.rl_config.q_init_pos),
+                 "q_visits": 0,
+                 "q_updated_at": datetime.now().isoformat(),
+                 "last_used_at": datetime.now().isoformat(),
+@@ -1235,14 +1403,15 @@ class MemoryService:
              print(f"[add_memory] Error: {e}\n{traceback.format_exc()}")
              return None
  
@@ -278,7 +310,7 @@ index 63bed73..b559d74 100644
      def _normalize_q(self, q: float, mean: float, std: float) -> float:
          """Z-norm q using provided mean/std (per-call stats)."""
          if not getattr(self, "use_z_score_normalization", True):
-@@ -1417,7 +1598,7 @@ class MemoryService:
+@@ -1417,7 +1586,7 @@ class MemoryService:
  
                  c_local = dict(c)
                  c_local["q_estimate"] = q
@@ -287,10 +319,37 @@ index 63bed73..b559d74 100644
                  q_values.append(q)
                  enriched.append(c_local)
  
-@@ -1484,7 +1665,11 @@ class MemoryService:
-                 for cand in pool:
+@@ -1464,27 +1633,24 @@ class MemoryService:
+             # -------- Sort by hybrid score --------
+             enriched_sorted = sorted(enriched, key=lambda x: x["score"], reverse=True)
+ 
+-            # -------- epsilon-greedy sampling --------
++            # -------- Phase-B: greedy top-k₂ selection (paper Sec 4.2) --------
++            # Paper uses pure score-ranked selection (equivalent to Boltzmann
++            # optimal policy μ*(m|s) ∝ π_sim·exp(βQ), Appendix A.4.3).
++            # No ε-greedy randomization — exploration is implicit in Q dynamics.
+             topk = min(self.rl_config.topk, len(enriched_sorted))
+             if not getattr(self, "dedup_by_task_id", False):
+-                if random.random() < self.rl_config.epsilon:
+-                    selected = random.sample(enriched_sorted, topk)
+-                else:
+-                    selected = enriched_sorted[:topk]
++                selected = enriched_sorted[:topk]
+             else:
+-                # LLB-only: de-dup by task_id while keeping epsilon-greedy behavior.
+-                # - greedy: iterate score-desc
+-                # - epsilon: shuffle before taking unique tasks
+-                pool = list(enriched_sorted)
+-                if random.random() < self.rl_config.epsilon:
+-                    random.shuffle(pool)
+-
++                # De-dup by task_id: greedy iterate score-desc, skip duplicates.
+                 selected = []
+                 seen_tasks: set[str] = set()
+-                for cand in pool:
++                for cand in enriched_sorted:
                      tid = cand.get("task_id")
-                     # If task_id missing, treat as unique by memory_id to avoid collapsing unrelated entries.
+-                    # If task_id missing, treat as unique by memory_id to avoid collapsing unrelated entries.
 -                    key = str(tid) if tid else f"__missing_task_id__:{cand.get('memory_id')}"
 +                    key = (
 +                        str(tid)
@@ -300,7 +359,44 @@ index 63bed73..b559d74 100644
                      if key in seen_tasks:
                          continue
                      seen_tasks.add(key)
-@@ -1684,8 +1869,6 @@ class MemoryService:
+@@ -1568,31 +1734,22 @@ class MemoryService:
+ 
+                 # Attach RL-style meta defaults.
+                 #
+-                # IMPORTANT: do NOT blindly override upstream metadata (runner may
+-                # provide q_value based on success/failure). Only fill missing
+-                # fields, and when q_value is missing/invalid, initialize from
+-                # q_init_pos/q_init_neg according to the success flag.
++                # Paper Table 8: unified Q_init=0.0 regardless of success/failure.
+                 meta.setdefault("success", bool(succ))
+ 
+                 rl_cfg = getattr(self, "rl_config", None)
+                 try:
+-                    q_init_pos = float(getattr(rl_cfg, "q_init_pos", 0.0))
+-                except Exception:
+-                    q_init_pos = 0.0
+-                try:
+-                    q_init_neg = float(getattr(rl_cfg, "q_init_neg", 0.0))
++                    q_init = float(getattr(rl_cfg, "q_init_pos", 0.0))
+                 except Exception:
+-                    q_init_neg = 0.0
++                    q_init = 0.0
+ 
+-                default_q = q_init_pos if bool(succ) else q_init_neg
+                 if "q_value" not in meta or meta.get("q_value") is None:
+-                    meta["q_value"] = default_q
++                    meta["q_value"] = q_init
+                 else:
+-                    # If provided but not castable, fall back to the default.
+                     try:
+                         meta["q_value"] = float(meta["q_value"])
+                     except Exception:
+-                        meta["q_value"] = default_q
++                        meta["q_value"] = q_init
+ 
+                 meta.setdefault("q_visits", 0)
+                 meta.setdefault("q_updated_at", datetime.now().isoformat())
+@@ -1684,8 +1841,6 @@ class MemoryService:
          # 清理旧目录以保证原子性
          if os.path.isdir(cube_dst):
              shutil.rmtree(cube_dst)
@@ -309,7 +405,7 @@ index 63bed73..b559d74 100644
          # 1) dump cube 到全新目录（包含 textual_memory.json：完整向量与payload）
          cube_id = getattr(self, "default_cube_id", None)
          cube = self.mos.mem_cubes.get(cube_id) if cube_id else None
-@@ -1695,23 +1878,40 @@ class MemoryService:
+@@ -1695,23 +1850,40 @@ class MemoryService:
          # 2) 拷贝 qdrant 文件目录（便于直接加载；如失败不影响最小可复现）
          qdrant_src = getattr(self, "_qdrant_dir", None)
          qdrant_copied = False
@@ -365,7 +461,7 @@ index 63bed73..b559d74 100644
          # 3) 统计与校验
          textual_path = os.path.join(cube_dst, "textual_memory.json")
          md5 = None
-@@ -1810,6 +2010,54 @@ class MemoryService:
+@@ -1810,6 +1982,54 @@ class MemoryService:
                  pass
          if not os.path.isdir(cube_dir):
              raise ValueError(f"Snapshot cube directory not found: {cube_dir}")
@@ -420,7 +516,7 @@ index 63bed73..b559d74 100644
          # 构造 default_config 以覆盖向量库路径与基础 provider 配置
          chat = self.mos_config.chat_model
          openai_cfg = chat.config.model_dump()
-@@ -1837,7 +2085,7 @@ class MemoryService:
+@@ -1837,7 +2057,7 @@ class MemoryService:
                          "backend": "qdrant",
                          "config": {
                              "collection_name": f"memp_{self.user_id}_snapshot",
@@ -429,7 +525,7 @@ index 63bed73..b559d74 100644
                              "distance_metric": "cosine",
                              "path": qdrant_dir,
                          },
-@@ -1847,21 +2095,13 @@ class MemoryService:
+@@ -1847,21 +2067,13 @@ class MemoryService:
              act_mem={"backend": "uninitialized", "config": {}},
              para_mem={"backend": "uninitialized", "config": {}},
          )
@@ -452,7 +548,7 @@ index 63bed73..b559d74 100644
              )
  
          try:
-@@ -1894,7 +2134,9 @@ class MemoryService:
+@@ -1894,7 +2106,9 @@ class MemoryService:
                      except Exception:
                          pass
                  os.makedirs(qdrant_dir, exist_ok=True)
@@ -463,7 +559,7 @@ index 63bed73..b559d74 100644
              else:
                  raise
          target_id = mem_cube_id or f"cube_{self.user_id}_snapshot"
-@@ -2013,14 +2255,27 @@ class MemoryService:
+@@ -2013,14 +2227,27 @@ class MemoryService:
          embed = getattr(self.embedding_provider, "embed", None)
          if missing_queries and callable(embed):
              batch_size = getattr(self, "embedding_batch_size", 256)
