@@ -168,15 +168,57 @@ MEMORY_CONTEXT_TEMPLATE = """\
 
 ## Historical Experience
 
-The following experiences from similar vulnerability types may help. \
-Pay attention to: the approach that worked (or failed), the input format \
-used, and any patterns specific to this project type.
-
-{memories}
-
+The following experiences from similar vulnerability types may help.
+{success_section}{failure_section}
 Use these as reference but adapt to the specific vulnerability — don't \
 copy PoC content directly as each vulnerability has unique triggering \
 conditions.
+"""
+
+SUCCESS_MEMORY_HEADER = """\
+
+### Successful Experiences (follow these patterns)
+
+{memories}
+"""
+
+FAILURE_MEMORY_HEADER = """\
+
+### Failed Experiences (avoid these mistakes)
+
+{memories}
+"""
+
+FAILURE_REFLECTION_PROMPT = """\
+You are analyzing a failed cybersecurity vulnerability reproduction attempt.
+
+## Task Description
+{task_description}
+
+## Project Info
+Project: {project_name} ({project_language})
+Crash type: {crash_type}
+
+## Agent Trajectory (Failed Attempt)
+{trajectory}
+
+## Result
+Status: {status} | PoC found: {poc_found} | Validation passed: {validation_passed}
+
+Analyze this failed attempt concisely. Focus on:
+1. **Root cause of failure**: What was the fundamental reason the PoC didn't work?
+2. **Key mistakes**: What specific wrong assumptions or approaches were taken?
+3. **What to avoid**: What patterns should be avoided in future similar tasks?
+
+Be brief and actionable (max 200 words). Do NOT include the full trajectory \
+or step-by-step description — only the critical error analysis.
+
+Format your response as:
+ROOT CAUSE: <one sentence>
+KEY MISTAKES:
+- <mistake 1>
+- <mistake 2>
+AVOID: <what to avoid in future>
 """
 
 
@@ -564,9 +606,17 @@ class MemRLHelper:
     def retrieve(self, query: str) -> tuple[str, list[str], dict[str, str | None]]:
         """Retrieve relevant memories and format as prompt context.
 
-        When value-driven RL is enabled, uses retrieve_query() for hybrid
-        similarity+Q-value ranking with ε-greedy exploration.
-        Otherwise falls back to pure similarity retrieval.
+        Retrieves multiple memories using hybrid similarity+Q-value ranking,
+        then separates them into success and failure categories with
+        differentiated formatting:
+
+        - SUCCESS memories: Full structured content (task + script + trajectory)
+          with Q-value and similarity score for the agent to follow.
+        - FAILURE memories: Concise reflection (root cause + key mistakes +
+          avoidance patterns) with Q-value — no verbose trajectory.
+
+        This follows the MemRL paper's two-phase retrieval and differentiated
+        presentation design.
 
         Returns:
             (formatted_prompt_text, list_of_retrieved_memory_ids,
@@ -620,17 +670,90 @@ class MemRLHelper:
                     if mem.get("memory_id") and mem["memory_id"] != "unknown"
                 ]
 
-            parts = []
-            for i, mem in enumerate(memories, 1):
+            # Separate memories into success and failure categories
+            success_parts: list[str] = []
+            failure_parts: list[str] = []
+            s_idx = 0
+            f_idx = 0
+
+            for mem in memories:
                 content = mem.get("content", mem.get("full_content", ""))
                 if not content:
                     continue
-                if len(content) > 2000:
-                    content = content[:2000] + "\n... (truncated)"
-                parts.append(f"[Experience {i}]\n{content}")
-            if not parts:
+
+                # Extract metadata for categorization and scoring info
+                md = mem.get("metadata", {})
+                if hasattr(md, "model_extra"):
+                    md_dict = md.model_extra if md.model_extra else {}
+                elif isinstance(md, dict):
+                    md_dict = md
+                else:
+                    md_dict = {}
+                is_success = md_dict.get("success", False)
+                q_value = mem.get("q_estimate", md_dict.get("q_value", 0.0))
+                similarity = mem.get("similarity", 0.0)
+                score = mem.get("score", 0.0)
+
+                if is_success:
+                    s_idx += 1
+                    if len(content) > 2500:
+                        content = content[:2500] + "\n... (truncated)"
+                    success_parts.append(
+                        f"[Success #{s_idx}] (Q={q_value:.2f}, sim={similarity:.2f}, score={score:.2f})\n"
+                        f"{content}"
+                    )
+                else:
+                    f_idx += 1
+                    # For failure memories: extract only the reflection part
+                    # (skip verbose trajectory if present)
+                    if "## Failure Reflection" in content:
+                        # New-format failure memory with LLM-generated reflection
+                        reflection_start = content.find("## Failure Reflection")
+                        # Keep task header + reflection only
+                        header_part = content[:reflection_start].strip()
+                        reflection_part = content[reflection_start:].strip()
+                        # Truncate header to essentials (first few lines)
+                        header_lines = header_part.split("\n")[:6]
+                        content = "\n".join(header_lines) + "\n\n" + reflection_part
+                    elif "## Agent Problem-Solving Trajectory" in content:
+                        # Old-format failure memory with full trajectory — trim it
+                        traj_start = content.find("## Agent Problem-Solving Trajectory")
+                        header_part = content[:traj_start].strip()
+                        traj_part = content[traj_start:]
+                        # Keep only first 500 chars of trajectory for context
+                        if len(traj_part) > 500:
+                            traj_part = (
+                                traj_part[:500]
+                                + "\n... (trajectory truncated — see key info above)"
+                            )
+                        content = header_part + "\n\n" + traj_part
+
+                    if len(content) > 1500:
+                        content = content[:1500] + "\n... (truncated)"
+                    failure_parts.append(
+                        f"[Failure #{f_idx}] (Q={q_value:.2f}, sim={similarity:.2f}, score={score:.2f})\n"
+                        f"{content}"
+                    )
+
+            if not success_parts and not failure_parts:
                 return "", memory_ids, mem_task_ids
-            text = MEMORY_CONTEXT_TEMPLATE.format(memories="\n\n".join(parts))
+
+            # Build formatted sections
+            success_section = ""
+            failure_section = ""
+            if success_parts:
+                success_section = SUCCESS_MEMORY_HEADER.format(
+                    memories="\n\n".join(success_parts)
+                )
+            if failure_parts:
+                failure_section = FAILURE_MEMORY_HEADER.format(
+                    memories="\n\n".join(failure_parts)
+                )
+
+            text = MEMORY_CONTEXT_TEMPLATE.format(
+                success_section=success_section,
+                failure_section=failure_section,
+            )
             return text, memory_ids, mem_task_ids
         except Exception as e:
             logger.warning("Memory retrieval failed: %s", e)
@@ -657,22 +780,57 @@ class MemRLHelper:
         except Exception as e:
             logger.warning("Q-value update failed: %s", e)
 
+    def generate_failure_reflection(
+        self,
+        task_description: str,
+        trajectory: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        """Use LLM to generate a concise failure reflection.
+
+        Instead of storing the full trajectory for failed tasks, we extract
+        the key error analysis — root cause, mistakes, and what to avoid.
+        This follows the MemRL paper's FAILURE_REFLECTION design.
+        """
+        try:
+            llm = getattr(self.service, "llm_provider", None)
+            if not llm or not hasattr(llm, "generate"):
+                return ""
+
+            prompt = FAILURE_REFLECTION_PROMPT.format(
+                task_description=task_description,
+                project_name=metadata.get("project", "unknown"),
+                project_language=metadata.get("project_language", "unknown"),
+                crash_type=metadata.get("crash_type", "unknown"),
+                trajectory=trajectory[:4000],
+                status=metadata.get("status", "unknown"),
+                poc_found=metadata.get("poc_found", False),
+                validation_passed=metadata.get("success", False),
+            )
+            messages = [{"role": "user", "content": prompt}]
+            reflection = llm.generate(messages, temperature=0.3)
+            return reflection.strip() if reflection else ""
+        except Exception as e:
+            logger.warning("Failure reflection generation failed: %s", e)
+            return ""
+
     def build(
         self, task_description: str, trajectory: str, metadata: dict[str, Any]
     ) -> str | None:
         """Build memory from a completed task. Returns the memory_id.
 
-        Also registers the new memory in dict_memory/query_embeddings so that
-        retrieve_query() (value-driven hybrid retrieval) can find it.
-        build_memory() alone only writes to MemOS but does NOT populate the
-        in-process caches that retrieve_query() depends on.
+        Memory content is differentiated by outcome:
+        - SUCCESS: Full structured content (task + script + trajectory) for
+          the agent to follow successful patterns.
+        - FAILURE: Concise reflection (root cause + mistakes + avoidance)
+          generated by LLM, without verbose trajectory details.
+
+        This follows the MemRL paper's Intent-Experience-Utility design
+        where success → SUCCESS_PROCEDURE and failure → FAILURE_REFLECTION.
 
         DEDUP FIX: If a memory for this exact task_description already exists
         in dict_memory, we skip creating a new entry and return the existing
-        memory_id instead. This prevents the same task from accumulating
-        duplicate memory entries across rounds (the root cause of 300 unique
-        texts appearing as 2700+ entries). The existing memory's Q-value
-        will be updated separately by the caller via update_values().
+        memory_id instead.
 
         NOTE: Q-value update is NOT done here — the caller decides when to
         update (inline per-task for Round 2+, batch after all tasks for Round 1).
@@ -680,9 +838,12 @@ class MemRLHelper:
         if not self.service:
             return None
         try:
-            # DEDUP CHECK: If we already have a memory for this exact
-            # task_description, return the existing memory_id without
-            # creating a duplicate. This is the primary dedup mechanism.
+            # DEDUP CHECK (CyberGym-specific, not in paper):
+            # Paper says every interaction creates a new triplet. But in our
+            # multi-round evolution (300 tasks × N rounds), the same task_description
+            # would produce N duplicate memories. We deduplicate by task_description
+            # to keep memory bank at ~300 entries. Q-values still update via RL.
+            # Paper notes "periodic consolidation" as future work (Appendix G.1).
             dm = getattr(self.service, "dict_memory", None)
             if dm is not None and task_description in dm:
                 existing_ids = dm[task_description]
@@ -695,8 +856,9 @@ class MemRLHelper:
                     )
                     return existing_id
 
+            is_success = metadata.get("success", False)
+
             # Pre-compute embedding OUTSIDE lock (network call may be slow).
-            # This runs concurrently across threads without touching SQLite.
             _new_vec = None
             embedder = getattr(self.service, "embedding_provider", None)
             qe = getattr(self.service, "query_embeddings", None)
@@ -711,14 +873,78 @@ class MemRLHelper:
                 except Exception:
                     pass
 
-            # Phase 1: LLM call + content preparation OUTSIDE lock.
-            # This is the expensive part (2-5s for PROCEDURALIZATION strategy).
-            # Multiple threads can run prepare_memory concurrently.
-            prepared = self.service.prepare_memory(
-                task_description=task_description,
-                trajectory=trajectory,
-                metadata=metadata,
-            )
+            if is_success:
+                # SUCCESS PATH: Full proceduralization (LLM generates SCRIPT
+                # + preserves TRAJECTORY). This is the expensive path (2-5s).
+                prepared = self.service.prepare_memory(
+                    task_description=task_description,
+                    trajectory=trajectory,
+                    metadata=metadata,
+                )
+            else:
+                # FAILURE PATH: Generate concise reflection, then directly
+                # construct the prepared dict — skip prepare_memory() to avoid
+                # a redundant LLM proceduralization call on the reflection text.
+                # This follows the MemRL paper's FAILURE_REFLECTION design.
+                reflection = self.generate_failure_reflection(
+                    task_description, trajectory, metadata
+                )
+                if reflection:
+                    header_end = trajectory.find(
+                        "\n## Agent Problem-Solving Trajectory\n"
+                    )
+                    if header_end != -1:
+                        task_header = trajectory[:header_end]
+                    else:
+                        task_header = trajectory.split("\n\n")[0]
+                    full_content = (
+                        f"Task: {task_description}\n\n"
+                        f"{task_header}\n\n"
+                        f"## Failure Reflection\n{reflection}"
+                    )
+                else:
+                    # Reflection generation failed — fall back to storing
+                    # a trimmed trajectory (first 2000 chars only).
+                    full_content = f"Task: {task_description}\n\n{trajectory[:2000]}"
+
+                # Build the prepared dict manually (mirrors prepare_memory output)
+                from datetime import datetime as _dt
+
+                source_benchmark = metadata.get("source_benchmark", "unknown")
+                base_meta: dict[str, Any] = {
+                    "type": "adjustment",
+                    "source": "conversation",
+                    "source_benchmark": source_benchmark,
+                    "success": False,
+                    "task_id": metadata.get("task_id"),
+                    "strategy_build": "proceduralization",
+                    "strategy_retrieve": "query",
+                    "strategy_update": "adjustment",
+                    "confidence": getattr(self.service, "memory_confidence", 100.0)
+                    * 0.8,
+                    "full_content": full_content,
+                }
+                rl_cfg = getattr(self.service, "rl_config", None)
+                if getattr(self.service, "enable_value_driven", False) and rl_cfg:
+                    # Paper Table 8: unified Q_init=0.0 for all memories
+                    base_meta |= {
+                        "q_value": float(rl_cfg.q_init_pos),
+                        "q_visits": 0,
+                        "q_updated_at": _dt.now().isoformat(),
+                        "last_used_at": _dt.now().isoformat(),
+                        "reward_ma": 0.0,
+                    }
+                prepared = {
+                    "task_description": task_description,
+                    "full_content": full_content,
+                    "base_meta": base_meta,
+                    "success": False,
+                }
+                logger.debug(
+                    "Built failure reflection for task '%s' (%d chars, skipped proceduralization)",
+                    task_description[:60],
+                    len(full_content),
+                )
 
             # Phase 2: DB write + cache update INSIDE lock (fast, ~0.1s).
             with self._state_lock:
@@ -1322,42 +1548,21 @@ async def run_batch(
 
             if memrl:
                 # ── Update Q-values for retrieved memories (RL feedback) ──
-                # ASYMMETRIC Q-VALUE ATTRIBUTION:
-                # The memory embedding key IS the task_description (vulnerability
-                # description), so cross-task cosine similarity can reach 0.81
-                # for unrelated tasks with similar bug types. This means we
-                # can't use similarity to distinguish "same task" from "similar
-                # task". Instead we use task_id for precise attribution:
+                # SYMMETRIC Q-VALUE ATTRIBUTION (paper Sec 4.3, Eq. 4):
+                # Q_new ← Q_old + α(r - Q_old) applied to ALL retrieved
+                # memories that were injected into the agent context.
+                # The paper treats all injected memories as contributors
+                # and updates them uniformly with the environmental reward.
+                # Credit-assignment refinement (e.g. Shapley) is future work.
                 #
-                # - SUCCESS → reward ALL retrieved memories (cross-task memories
-                #   that were retrieved and led to success may have been helpful)
-                # - FAILURE → only penalize SAME-TASK memory (cross-task memories
-                #   are blameless for a different task's failure)
-                #
-                # This prevents the core pathology: good memories getting their
-                # Q-values destroyed because unrelated hard tasks retrieved them.
+                # update_values() internally maps truthy → success_reward(+1)
+                # and falsy → failure_reward(-1) via rl_config.
                 if retrieved_ids:
-                    if real_success:
-                        await asyncio.to_thread(
-                            memrl.update_values,
-                            [1.0],
-                            [retrieved_ids],
-                        )
-                    elif retrieved_mem_task_ids:
-                        current_task_base = (
-                            task_id.split("/")[0] if "/" in task_id else task_id
-                        )
-                        same_task_ids = [
-                            mid
-                            for mid in retrieved_ids
-                            if retrieved_mem_task_ids.get(mid) == current_task_base
-                        ]
-                        if same_task_ids:
-                            await asyncio.to_thread(
-                                memrl.update_values,
-                                [0.0],
-                                [same_task_ids],
-                            )
+                    await asyncio.to_thread(
+                        memrl.update_values,
+                        [1.0 if real_success else 0.0],
+                        [retrieved_ids],
+                    )
 
                 # Build rich trajectory from saved session file
                 session_file = sessions_dir / f"{safe_name}.json"
@@ -1403,15 +1608,20 @@ async def run_batch(
                         "source": "cybergym",
                         "task_id": task_id,
                         "project": instance.get("project_name", ""),
+                        "project_language": instance.get("project_language", ""),
+                        "crash_type": instance.get("crash_type", ""),
                         "success": real_success,
                         "validated": validated,
                         "level": level,
                         "has_trajectory": bool(session_trajectory),
+                        "poc_found": poc_found,
+                        "status": result.get("status", ""),
                     },
                 )
 
-                # Inline Q-value self-update: immediately apply Q-learning
-                # with the known task outcome (Round 2+ per-task update).
+                # Inline Q-value self-update (paper Sec 4.3): new memory starts
+                # at Q_init=0.0, immediately updated with task outcome reward.
+                # After this: Q = 0 + α*(r - 0) = ±α (i.e. ±0.3).
                 if new_mem_id:
                     await asyncio.to_thread(
                         memrl.update_values,

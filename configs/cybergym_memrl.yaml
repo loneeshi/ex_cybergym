@@ -24,7 +24,10 @@ memory:
   update_strategy: "adjustment"
   k_retrieve: 3
   max_keywords: 8
-  confidence_threshold: 0.0
+  # δ (similarity gate): paper recommends top-20% quantile of pairwise cosine
+  # similarity. CyberGym cross-task sim distribution: mean=0.47, max=0.81.
+  # Conservative estimate aligned with paper's HLE benchmark (δ=0.25).
+  confidence_threshold: 0.3
   memory_confidence: 100.0
   add_similarity_threshold: 0.90
   user_id: "cybergym_user"
@@ -50,13 +53,16 @@ experiment:
 rl_config:
   epsilon: 0.08
   tau: 0.25
-  alpha: 0.2
+  # Paper Table 8: α=0.3 across all benchmarks
+  alpha: 0.3
   gamma: 0.0
-  q_init_pos: 1.0
-  q_init_neg: -1.0
+  # Paper Table 8: Q_init=0.0 (unified, no success/failure split)
+  q_init_pos: 0.0
+  q_init_neg: 0.0
   success_reward: 1.0
   failure_reward: -1.0
   topk: 3
   novelty_threshold: 0.85
-  weight_sim: 0.4
-  weight_q: 0.6
+  # Paper ablation: λ=0.5 optimal (weight_sim = 1-λ, weight_q = λ)
+  weight_sim: 0.5
+  weight_q: 0.5

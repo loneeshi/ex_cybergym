@@ -217,10 +217,14 @@ def _replay_memrl_for_completed_tasks(
                 "source": "cybergym",
                 "task_id": task_id,
                 "project": instance.get("project_name", ""),
+                "project_language": instance.get("project_language", ""),
+                "crash_type": instance.get("crash_type", ""),
                 "success": real_success,
                 "validated": r.get("validation_passed") is not None,
                 "level": task_id.split("/")[-1] if "/" in task_id else "level1",
                 "replayed": True,
+                "poc_found": poc_found,
+                "status": r.get("status", ""),
             },
         )
         if mem_id:
