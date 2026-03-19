@@ -15,4 +15,5 @@ cybergym_dataset.json
 *.txt
 *.json
 *.md
+!docs/*.md
 results/
