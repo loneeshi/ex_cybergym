@@ -1228,12 +1228,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--task-file", type=str, default=None, help="File with task IDs (one per line)"
     )
-    p.add_argument(
-        "--subset-file",
-        type=str,
-        default=None,
-        help="JSON file containing a list of task IDs to run (overrides --num-tasks and --task-file)",
-    )
 
     # Evolution
     p.add_argument(
@@ -1296,24 +1290,12 @@ def main() -> None:
     instances = load_dataset_instances()
 
     # Select tasks
-    if args.subset_file:
-        try:
-            with open(args.subset_file, "r") as f:
-                task_ids = json.load(f)
-            logger.info(
-                "Loaded %d task IDs from subset file: %s",
-                len(task_ids),
-                args.subset_file,
-            )
-        except Exception as e:
-            logger.error("Failed to load subset file %s: %s", args.subset_file, e)
-            return
-    elif args.task_file:
+    if args.task_file:
         task_ids = load_task_ids_from_file(args.task_file)
     else:
         task_ids = list(instances.keys())
 
-    if args.num_tasks and not args.subset_file:
+    if args.num_tasks:
         task_ids = task_ids[: args.num_tasks]
 
     total_tasks = len(task_ids)
