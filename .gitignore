@@ -17,3 +17,4 @@ cybergym_dataset.json
 *.md
 !docs/*.md
 results/
+!tasks/*.json
