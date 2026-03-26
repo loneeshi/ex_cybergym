@@ -16,5 +16,7 @@ cybergym_dataset.json
 *.json
 *.md
 !docs/*.md
-results/
+results/*
+!results/evo_300_qwen_20260319/
+!results/evo_1507_nex_baseline/
 !tasks/*.json

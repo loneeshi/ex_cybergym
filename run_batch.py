@@ -381,9 +381,7 @@ class MemRLHelper:
             )
             config.llm.model = os.environ.get("MEMRL_LLM_MODEL", config.llm.model)
             config.embedding.api_key = (
-                os.environ.get("INF_API_KEY", "")
-                or os.environ.get("SILICONFLOW_KEY", "")
-                or config.embedding.api_key
+                os.environ.get("SILICONFLOW_KEY", "") or config.embedding.api_key
             )
             config.embedding.base_url = os.environ.get(
                 "MEMRL_EMBEDDING_BASE_URL", config.embedding.base_url

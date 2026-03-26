@@ -13,9 +13,9 @@ llm:
 
 embedding:
   provider: "openai"
-  api_key: "REPLACE_ME"
-  base_url: "https://og5o9mjcdgckcmejjobdgmjh9ddcjcmk.openapi-qb.sii.edu.cn/v1"
-  model: "qwen3-embedding-8b"
+  api_key: "sk-iwfhhzygybfimpvnqvumqdkwnoxdtdvnbzowvtmrykciedxy"
+  base_url: "https://api.siliconflow.cn/v1"
+  model: "Qwen/Qwen3-Embedding-8B"
   max_text_len: 4096
 
 memory:
