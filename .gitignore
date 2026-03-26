@@ -18,5 +18,10 @@ cybergym_dataset.json
 !docs/*.md
 results/*
 !results/evo_300_qwen_20260319/
+results/evo_300_qwen_20260319/*
+!results/evo_300_qwen_20260319/nex_vs_qwen_300_summary.json
+!results/evo_300_qwen_20260319/evolution_state.json
 !results/evo_1507_nex_baseline/
+results/evo_1507_nex_baseline/*
+!results/evo_1507_nex_baseline/evolution_state.json
 !tasks/*.json
